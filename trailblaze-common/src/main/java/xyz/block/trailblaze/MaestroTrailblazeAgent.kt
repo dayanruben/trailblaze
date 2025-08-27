@@ -1,6 +1,8 @@
 package xyz.block.trailblaze
 
+import kotlinx.coroutines.runBlocking
 import kotlinx.datetime.Clock
+import kotlinx.datetime.Instant
 import maestro.orchestra.Command
 import xyz.block.trailblaze.api.ScreenState
 import xyz.block.trailblaze.api.TrailblazeAgent
@@ -16,6 +18,7 @@ import xyz.block.trailblaze.toolcalls.TrailblazeToolResult
 import xyz.block.trailblaze.toolcalls.commands.memory.MemoryTrailblazeTool
 import xyz.block.trailblaze.toolcalls.getToolNameFromAnnotation
 import xyz.block.trailblaze.utils.ElementComparator
+import kotlin.random.Random
 
 /**
  * Abstract class for Trailblaze agents that handle Maestro commands.
@@ -25,7 +28,7 @@ import xyz.block.trailblaze.utils.ElementComparator
  */
 abstract class MaestroTrailblazeAgent : TrailblazeAgent {
 
-  protected abstract fun executeMaestroCommands(
+  protected abstract suspend fun executeMaestroCommands(
     commands: List<Command>,
     llmResponseId: String?,
   ): TrailblazeToolResult
@@ -37,9 +40,20 @@ abstract class MaestroTrailblazeAgent : TrailblazeAgent {
     memory.clear()
   }
 
-  fun runMaestroCommands(
+  @Deprecated("Prefer the suspend version of this function.")
+  fun runMaestroCommandsBlocking(
     maestroCommands: List<Command>,
-    llmResponseId: String? = null,
+    llmResponseId: String?,
+  ): TrailblazeToolResult = runBlocking {
+    runMaestroCommands(
+      maestroCommands = maestroCommands,
+      llmResponseId = llmResponseId,
+    )
+  }
+
+  suspend fun runMaestroCommands(
+    maestroCommands: List<Command>,
+    llmResponseId: String?,
   ): TrailblazeToolResult {
     maestroCommands.forEach { command ->
       val result = executeMaestroCommands(
@@ -60,9 +74,13 @@ abstract class MaestroTrailblazeAgent : TrailblazeAgent {
     screenState: ScreenState?,
     elementComparator: ElementComparator,
   ): Pair<List<TrailblazeTool>, TrailblazeToolResult> {
+    val toolChainId = generateIdIfNull(
+      prefix = "tools",
+      llmResponseId = llmResponseId,
+    )
     val trailblazeExecutionContext = TrailblazeToolExecutionContext(
       screenState = screenState,
-      llmResponseId = llmResponseId,
+      llmResponseId = toolChainId,
       trailblazeAgent = this,
     )
 
@@ -71,7 +89,7 @@ abstract class MaestroTrailblazeAgent : TrailblazeAgent {
       when (trailblazeTool) {
         is ExecutableTrailblazeTool -> {
           toolsExecuted.add(trailblazeTool)
-          val result = handleExecutableTool(trailblazeTool, trailblazeExecutionContext)
+          val result = handleExecutableToolBlocking(trailblazeTool, trailblazeExecutionContext)
           if (result != TrailblazeToolResult.Success) {
             // Exit early if any tool execution fails
             return toolsExecuted to result
@@ -80,10 +98,14 @@ abstract class MaestroTrailblazeAgent : TrailblazeAgent {
 
         is DelegatingTrailblazeTool -> {
           val executableTools = trailblazeTool.toExecutableTrailblazeTools(trailblazeExecutionContext)
-          logDelegatingTrailblazeTool(trailblazeTool, executableTools)
+          logDelegatingTrailblazeTool(
+            trailblazeTool = trailblazeTool,
+            llmResponseId = toolChainId,
+            executableTools = executableTools,
+          )
           for (mappedTool in executableTools) {
             toolsExecuted.add(mappedTool)
-            val result = handleExecutableTool(mappedTool, trailblazeExecutionContext)
+            val result = handleExecutableToolBlocking(mappedTool, trailblazeExecutionContext)
             if (result != TrailblazeToolResult.Success) {
               // Exit early if any tool execution fails
               return toolsExecuted to result
@@ -113,21 +135,37 @@ abstract class MaestroTrailblazeAgent : TrailblazeAgent {
     return toolsExecuted to TrailblazeToolResult.Success
   }
 
-  private fun handleExecutableTool(
+  @Deprecated("Starting in Maestro 2.0.0 their api uses a suspend function. Prefer that implementation.")
+  private fun handleExecutableToolBlocking(
+    trailblazeTool: ExecutableTrailblazeTool,
+    trailblazeExecutionContext: TrailblazeToolExecutionContext,
+  ) = runBlocking {
+    handleExecutableTool(trailblazeTool, trailblazeExecutionContext)
+  }
+
+  private suspend fun handleExecutableTool(
     trailblazeTool: ExecutableTrailblazeTool,
     trailblazeExecutionContext: TrailblazeToolExecutionContext,
   ): TrailblazeToolResult {
-    val trailblazeToolResult = trailblazeTool.execute(trailblazeExecutionContext)
-    logTrailblazeTool(trailblazeTool, trailblazeExecutionContext, trailblazeToolResult)
+    val timeBeforeToolExecution = Clock.System.now()
+    val trailblazeToolResult = trailblazeTool.execute(
+      toolExecutionContext = trailblazeExecutionContext,
+    )
+    logTrailblazeTool(
+      trailblazeTool = trailblazeTool,
+      timeBeforeToolExecution = timeBeforeToolExecution,
+      trailblazeExecutionContext = trailblazeExecutionContext,
+      trailblazeToolResult = trailblazeToolResult,
+    )
     return trailblazeToolResult
   }
 
   private fun logTrailblazeTool(
     trailblazeTool: ExecutableTrailblazeTool,
+    timeBeforeToolExecution: Instant,
     trailblazeExecutionContext: TrailblazeToolExecutionContext,
     trailblazeToolResult: TrailblazeToolResult,
   ) {
-    val timeBeforeToolExecution = Clock.System.now()
     val toolLog = TrailblazeLog.TrailblazeToolLog(
       command = trailblazeTool,
       toolName = trailblazeTool.getToolNameFromAnnotation(),
@@ -145,15 +183,30 @@ abstract class MaestroTrailblazeAgent : TrailblazeAgent {
 
   private fun logDelegatingTrailblazeTool(
     trailblazeTool: DelegatingTrailblazeTool,
+    llmResponseId: String?,
     executableTools: List<ExecutableTrailblazeTool>,
   ) {
     TrailblazeLogger.log(
       TrailblazeLog.DelegatingTrailblazeToolLog(
         command = trailblazeTool,
+        toolName = trailblazeTool.getToolNameFromAnnotation(),
         executableTools = executableTools,
         session = TrailblazeLogger.getCurrentSessionId(),
+        llmResponseId = llmResponseId,
         timestamp = Clock.System.now(),
       ),
     )
+  }
+
+  companion object {
+    /**
+     * Generates a unique ID if no ID is provided.
+     */
+    fun generateIdIfNull(prefix: String?, llmResponseId: String?): String = llmResponseId ?: buildString {
+      prefix?.let {
+        appendLine("$prefix-")
+      }
+      appendLine(Random.nextLong().toString())
+    }
   }
 }

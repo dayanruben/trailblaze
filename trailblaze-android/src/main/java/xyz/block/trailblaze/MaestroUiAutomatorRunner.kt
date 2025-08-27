@@ -1,10 +1,12 @@
 package xyz.block.trailblaze
 
+import kotlinx.coroutines.runBlocking
 import kotlinx.datetime.Clock
 import maestro.Maestro
 import maestro.orchestra.ApplyConfigurationCommand
 import maestro.orchestra.Command
 import maestro.orchestra.MaestroCommand
+import xyz.block.trailblaze.MaestroTrailblazeAgent.Companion.generateIdIfNull
 import xyz.block.trailblaze.android.maestro.LoggingDriver
 import xyz.block.trailblaze.android.maestro.MaestroAndroidUiAutomatorDriver
 import xyz.block.trailblaze.android.maestro.orchestra.Orchestra
@@ -13,7 +15,6 @@ import xyz.block.trailblaze.android.uiautomator.AndroidOnDeviceUiAutomatorScreen
 import xyz.block.trailblaze.logs.client.TrailblazeJsonInstance
 import xyz.block.trailblaze.logs.client.TrailblazeLog
 import xyz.block.trailblaze.logs.client.TrailblazeLogger
-import xyz.block.trailblaze.maestro.MaestroYamlParser
 import xyz.block.trailblaze.toolcalls.TrailblazeToolResult
 import xyz.block.trailblaze.utils.Ext.asJsonObject
 
@@ -22,39 +23,31 @@ import xyz.block.trailblaze.utils.Ext.asJsonObject
  */
 object MaestroUiAutomatorRunner {
 
-  fun runCommands(
+  suspend fun runCommands(
     commands: List<Command>,
     llmResponseId: String?,
-  ): TrailblazeToolResult = runMaestroYaml(
+  ): TrailblazeToolResult = runMaestroCommands(
     commands = commands.filterNot { it is ApplyConfigurationCommand }.map { MaestroCommand(it) },
     llmResponseId = llmResponseId,
   )
 
-  fun runCommand(
+  fun runCommandsBlocking(
+    commands: List<Command>,
+    llmResponseId: String?,
+  ): TrailblazeToolResult = runBlocking {
+    runCommands(
+      commands = commands,
+      llmResponseId = llmResponseId,
+    )
+  }
+
+  suspend fun runCommand(
+    llmResponseId: String?,
     vararg command: Command,
   ): TrailblazeToolResult = runCommands(
     commands = command.toList(),
-    llmResponseId = null,
+    llmResponseId = llmResponseId,
   )
-
-  fun runYamlResource(resourcePath: String): TrailblazeToolResult {
-    @Suppress("RECEIVER_NULLABILITY_MISMATCH_BASED_ON_JAVA_ANNOTATIONS")
-    val yaml = object {}.javaClass.classLoader.getResource(resourcePath)?.readText()
-    return runMaestroYaml(yaml ?: error("Resource not found: $resourcePath"))
-  }
-
-  fun runMaestroYaml(appId: String, yamlStringWithoutConfig: String): TrailblazeToolResult {
-    val maestroCommandsFromYaml: List<MaestroCommand> = MaestroYamlParser.parseYaml(
-      yaml = yamlStringWithoutConfig,
-      appId = appId,
-    ).map {
-      MaestroCommand(it)
-    }
-    return runMaestroYaml(
-      maestroCommandsFromYaml,
-      null,
-    )
-  }
 
   private val maestro = Maestro(
     driver = LoggingDriver(
@@ -67,18 +60,15 @@ object MaestroUiAutomatorRunner {
     ),
   )
 
-  private fun runMaestroYaml(yamlString: String): TrailblazeToolResult {
-    val commands: List<Command> = MaestroYamlParser.parseYaml(
-      yamlString,
-    )
-    val result = runCommands(commands, null)
-    return result
-  }
-
-  private fun runMaestroYaml(
+  private suspend fun runMaestroCommands(
     commands: List<MaestroCommand>,
     llmResponseId: String?,
   ): TrailblazeToolResult {
+    val toolChainId = generateIdIfNull(
+      prefix = "maestro",
+      llmResponseId = llmResponseId,
+    )
+
     commands.forEach { maestroCommand ->
       val maestroCommandJsonObj = maestroCommand.asJsonObject()
       val startTime = Clock.System.now()
@@ -102,13 +92,13 @@ object MaestroUiAutomatorRunner {
           trailblazeToolResult = result,
           timestamp = startTime,
           durationMs = Clock.System.now().toEpochMilliseconds() - startTime.toEpochMilliseconds(),
-          llmResponseId = llmResponseId,
+          llmResponseId = toolChainId,
           successful = result is TrailblazeToolResult.Success,
           session = TrailblazeLogger.getCurrentSessionId(),
         ),
       )
 
-      if (runSuccess == false) {
+      if (!runSuccess) {
         return result
       }
     }
