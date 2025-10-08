@@ -19,6 +19,7 @@ import xyz.block.trailblaze.host.devices.TrailblazeDeviceService
 import xyz.block.trailblaze.host.screenstate.HostMaestroDriverScreenState
 import xyz.block.trailblaze.logs.client.TrailblazeLog
 import xyz.block.trailblaze.logs.client.TrailblazeLogger
+import xyz.block.trailblaze.logs.model.TraceId
 import xyz.block.trailblaze.toolcalls.TrailblazeToolResult
 import xyz.block.trailblaze.utils.Ext.asJsonObject
 import java.io.File
@@ -31,7 +32,9 @@ class MaestroHostRunnerImpl(
     if (requestedPlatform == null) {
       TrailblazeDeviceService.getFirstConnectedDevice()
     } else {
-      TrailblazeDeviceService.getConnectedDevice(requestedPlatform) ?: error("No connected devices found.")
+      TrailblazeDeviceService.getConnectedDevice(requestedPlatform) ?: error(
+        "No connected devices found for platform $requestedPlatform.",
+      )
     }
   }
 
@@ -41,7 +44,13 @@ class MaestroHostRunnerImpl(
     connectedDevice.loggingDriver
   }
 
+  companion object {
+    var callCount = 0
+  }
+
   override val screenStateProvider: () -> ScreenState = {
+    callCount++
+    println("screenStateProvider call count: $callCount")
     HostMaestroDriverScreenState(
       maestroDriver = loggingDriver,
       setOfMarkEnabled = setOfMarkEnabled,
@@ -63,26 +72,26 @@ class MaestroHostRunnerImpl(
       .withEnv(env.withInjectedShellEnvVars().withDefaultEnvVars(flowFile))
     return runMaestroCommandsInternal(
       commands = maestroCommands,
-      llmResponseId = null,
+      traceId = null,
     )
   }
 
   override fun runMaestroCommand(vararg commands: Command): TrailblazeToolResult = runMaestroCommands(
     commands = commands.toList(),
-    llmResponseId = null,
+    traceId = null,
   )
 
   override fun runMaestroCommands(
     commands: List<Command>,
-    llmResponseId: String?,
+    traceId: TraceId?,
   ): TrailblazeToolResult = runMaestroCommandsInternal(
     commands = commands.map { MaestroCommand(it) },
-    llmResponseId = llmResponseId,
+    traceId = traceId,
   )
 
   private fun runMaestroCommandsInternal(
     commands: List<MaestroCommand>,
-    llmResponseId: String?,
+    traceId: TraceId?,
   ): TrailblazeToolResult {
     commands.forEach { maestroCommand ->
       val startTime = Clock.System.now()
@@ -109,7 +118,7 @@ class MaestroHostRunnerImpl(
           trailblazeToolResult = result,
           timestamp = startTime,
           durationMs = Clock.System.now().toEpochMilliseconds() - startTime.toEpochMilliseconds(),
-          llmResponseId = llmResponseId,
+          traceId = traceId,
           successful = result is TrailblazeToolResult.Success,
           session = TrailblazeLogger.getCurrentSessionId(),
         ),
@@ -119,20 +128,5 @@ class MaestroHostRunnerImpl(
       }
     }
     return TrailblazeToolResult.Success
-  }
-
-  fun withSetOfMarkEnabled(setOfMarkEnabled: Boolean): MaestroHostRunner = object : MaestroHostRunner {
-    override val screenStateProvider: () -> ScreenState = {
-      HostMaestroDriverScreenState(
-        maestroDriver = loggingDriver,
-        setOfMarkEnabled = setOfMarkEnabled,
-      )
-    }
-
-    override fun runMaestroYaml(yaml: String) = this@MaestroHostRunnerImpl.runMaestroYaml(yaml)
-    override fun runFlowFile(flowFile: File) = this@MaestroHostRunnerImpl.runFlowFile(flowFile)
-    override fun runMaestroCommand(vararg commands: Command) = this@MaestroHostRunnerImpl.runMaestroCommand(*commands)
-
-    override fun runMaestroCommands(commands: List<Command>, llmResponseId: String?) = this@MaestroHostRunnerImpl.runMaestroCommands(commands, llmResponseId)
   }
 }
