@@ -2,6 +2,7 @@ package xyz.block.trailblaze.host.rules
 
 import xyz.block.trailblaze.devices.TrailblazeDeviceInfo
 import xyz.block.trailblaze.logs.client.TrailblazeLog
+import xyz.block.trailblaze.logs.client.TrailblazeScreenStateLog
 import xyz.block.trailblaze.report.utils.LogsRepo
 import xyz.block.trailblaze.rules.TrailblazeLoggingRule
 import xyz.block.trailblaze.session.TrailblazeSessionManager
@@ -14,13 +15,13 @@ class HostTrailblazeLoggingRule(
   sessionManager: TrailblazeSessionManager = TrailblazeSessionManager(),
 ) : TrailblazeLoggingRule(
   logsBaseUrl = logsBaseUrl,
-  writeLogToDisk = { currentTestName: String, log: TrailblazeLog ->
+  writeLogToDisk = { currentTestName: xyz.block.trailblaze.logs.model.SessionId, log: TrailblazeLog ->
     logsRepo.saveLogToDisk(log)
   },
-  writeScreenshotToDisk = { sessionId: String, fileName: String, bytes: ByteArray ->
-    logsRepo.saveScreenshotToDisk(sessionId, fileName, bytes)
+  writeScreenshotToDisk = { screenshot: TrailblazeScreenStateLog ->
+    logsRepo.saveScreenshotToDisk(screenshot)
   },
-  writeTraceToDisk = { sessionId: String, json: String ->
+  writeTraceToDisk = { sessionId: xyz.block.trailblaze.logs.model.SessionId, json: String ->
     val sessionDir = logsRepo.getSessionDir(sessionId)
     File(sessionDir, "trace.json").writeText(json)
   },

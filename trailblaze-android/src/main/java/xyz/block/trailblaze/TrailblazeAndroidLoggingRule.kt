@@ -9,16 +9,17 @@ import xyz.block.trailblaze.devices.TrailblazeDeviceInfo
 import xyz.block.trailblaze.devices.TrailblazeDriverType
 import xyz.block.trailblaze.logs.client.TrailblazeJsonInstance
 import xyz.block.trailblaze.logs.client.TrailblazeLog
+import xyz.block.trailblaze.logs.client.TrailblazeScreenStateLog
 import xyz.block.trailblaze.rules.TrailblazeLoggingRule
 
 class TrailblazeAndroidLoggingRule(
   trailblazeDeviceClassifiersProvider: () -> List<TrailblazeDeviceClassifier>,
 ) : TrailblazeLoggingRule(
   logsBaseUrl = InstrumentationArgUtil.logsEndpoint(),
-  writeLogToDisk = { currentTestName: String, log: TrailblazeLog ->
+  writeLogToDisk = { currentTestName: xyz.block.trailblaze.logs.model.SessionId, log: TrailblazeLog ->
     try {
       val json = TrailblazeJsonInstance.encodeToString(TrailblazeLog.serializer(), log)
-      val fileName = "${currentTestName}_${log.timestamp.toEpochMilliseconds()}.json"
+      val fileName = "${currentTestName.value}_${log.timestamp.toEpochMilliseconds()}.json"
       FileReadWriteUtil.writeToDownloadsFile(
         context = InstrumentationRegistry.getInstrumentation().context,
         fileName = fileName,
@@ -29,25 +30,25 @@ class TrailblazeAndroidLoggingRule(
       println("Error writing log to disk: ${e.message}")
     }
   },
-  writeScreenshotToDisk = { sessionId: String, fileName: String, bytes: ByteArray ->
+  writeScreenshotToDisk = { screenshot: TrailblazeScreenStateLog ->
     try {
       FileReadWriteUtil.writeToDownloadsFile(
         context = InstrumentationRegistry.getInstrumentation().context,
-        fileName = fileName,
-        contentBytes = bytes,
+        fileName = screenshot.fileName,
+        contentBytes = screenshot.screenState.screenshotBytes!!,
         directory = LOGS_DIR,
       )
     } catch (e: Exception) {
       println("Error writing screenshot to disk: ${e.message}")
     }
   },
-  writeTraceToDisk = { sessionId: String, json: String ->
+  writeTraceToDisk = { sessionId: xyz.block.trailblaze.logs.model.SessionId, json: String ->
     try {
       // Currently disabled due to exception on some API levels
       withInstrumentation {
         FileReadWriteUtil.writeToDownloadsFile(
           context = context,
-          fileName = "$sessionId-trace.json",
+          fileName = "${sessionId.value}-trace.json",
           contentBytes = json.toByteArray(),
           directory = LOGS_DIR,
         )
