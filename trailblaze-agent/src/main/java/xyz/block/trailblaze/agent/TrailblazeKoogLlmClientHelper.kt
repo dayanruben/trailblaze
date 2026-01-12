@@ -333,7 +333,7 @@ class TrailblazeKoogLlmClientHelper(
             add(
               ContentPart.Image(
                 content = AttachmentContent.Binary.Bytes(screenshotBytes),
-                format = ImageFormatDetector.detectFormat(screenshotBytes).fileExtension,
+                format = ImageFormatDetector.detectFormat(screenshotBytes).mimeSubtype,
               ),
             )
           }
