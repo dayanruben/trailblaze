@@ -1,6 +1,5 @@
 package xyz.block.trailblaze.cli
 
-import java.awt.GraphicsEnvironment
 import kotlinx.coroutines.runBlocking
 import picocli.CommandLine
 import picocli.CommandLine.Command
@@ -11,39 +10,40 @@ import xyz.block.trailblaze.TrailblazeVersion
 import xyz.block.trailblaze.capture.CaptureOptions
 import xyz.block.trailblaze.capture.CaptureSession
 import xyz.block.trailblaze.compose.driver.rpc.ComposeRpcServer
+import xyz.block.trailblaze.compose.driver.tools.ComposeToolSet
 import xyz.block.trailblaze.desktop.LlmTokenStatus
 import xyz.block.trailblaze.desktop.TrailblazeDesktopAppConfig
 import xyz.block.trailblaze.devices.TrailblazeConnectedDeviceSummary
-import xyz.block.trailblaze.devices.TrailblazeDevicePort
 import xyz.block.trailblaze.devices.TrailblazeDevicePlatform
+import xyz.block.trailblaze.devices.TrailblazeDevicePort
 import xyz.block.trailblaze.devices.TrailblazeDriverType
-import xyz.block.trailblaze.recordings.TrailRecordings
+import xyz.block.trailblaze.host.rules.BasePlaywrightElectronTest
 import xyz.block.trailblaze.llm.RunYamlRequest
-import xyz.block.trailblaze.logs.model.SessionId
-import xyz.block.trailblaze.logs.server.endpoints.CliRunRequest
 import xyz.block.trailblaze.llm.TrailblazeReferrer
+import xyz.block.trailblaze.logs.model.SessionId
+import xyz.block.trailblaze.logs.model.SessionStatus
+import xyz.block.trailblaze.logs.model.getSessionStatus
+import xyz.block.trailblaze.logs.server.endpoints.CliRunRequest
 import xyz.block.trailblaze.mcp.AgentImplementation
 import xyz.block.trailblaze.mcp.McpToolProfile
 import xyz.block.trailblaze.model.DesktopAppRunYamlParams
 import xyz.block.trailblaze.model.DeviceConnectionStatus
-import xyz.block.trailblaze.model.TrailblazeConfig
 import xyz.block.trailblaze.model.TrailExecutionResult
+import xyz.block.trailblaze.model.TrailblazeConfig
+import xyz.block.trailblaze.model.findById
+import xyz.block.trailblaze.playwright.tools.PlaywrightNativeToolSet
+import xyz.block.trailblaze.recordings.TrailRecordings
+import xyz.block.trailblaze.report.utils.LogsRepo
+import xyz.block.trailblaze.report.utils.TrailblazeYamlSessionRecording.generateRecordedYaml
 import xyz.block.trailblaze.ui.TrailblazeDesktopApp
 import xyz.block.trailblaze.ui.TrailblazeDeviceManager
 import xyz.block.trailblaze.ui.TrailblazePortManager
 import xyz.block.trailblaze.util.Console
-import xyz.block.trailblaze.util.TrailYamlTemplateResolver
-import xyz.block.trailblaze.yaml.TrailblazeYaml
-import xyz.block.trailblaze.yaml.createTrailblazeYaml
-import java.io.File
-import xyz.block.trailblaze.logs.model.SessionStatus
-import xyz.block.trailblaze.logs.model.getSessionStatus
-import xyz.block.trailblaze.report.utils.LogsRepo
-import xyz.block.trailblaze.report.utils.TrailblazeYamlSessionRecording.generateRecordedYaml
 import xyz.block.trailblaze.util.GitUtils
-import xyz.block.trailblaze.compose.driver.tools.ComposeToolSet
-import xyz.block.trailblaze.host.rules.BasePlaywrightElectronTest
-import xyz.block.trailblaze.playwright.tools.PlaywrightNativeToolSet
+import xyz.block.trailblaze.util.TrailYamlTemplateResolver
+import xyz.block.trailblaze.yaml.createTrailblazeYaml
+import java.awt.GraphicsEnvironment
+import java.io.File
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import kotlin.system.exitProcess
@@ -115,16 +115,17 @@ object TrailblazeCli {
       DesktopLogFileWriter.install(httpPort = httpPort)
     }
 
+    val cli = TrailblazeCliCommand(appProvider, configProvider)
+    val commandLine = CommandLine(cli)
+      .setCaseInsensitiveEnumValuesAllowed(true)
+
     // Support `sq` CLI integration: output JSON describing subcommands and exit.
     if (args.contains("--describe-commands")) {
-      println(describeCommands())
+      println(commandLine.describeCommands())
       return
     }
 
-    val cli = TrailblazeCliCommand(appProvider, configProvider)
-    val exitCode = CommandLine(cli)
-      .setCaseInsensitiveEnumValuesAllowed(true)
-      .execute(*args)
+    val exitCode = commandLine.execute(*args)
     if (exitCode != 0) {
       exitProcess(exitCode)
     }
@@ -144,37 +145,6 @@ object TrailblazeCli {
     return TrailblazeDevicePort.TRAILBLAZE_DEFAULT_HTTP_PORT
   }
 
-  /**
-   * Returns JSON describing the CLI's subcommands for `sq` CLI integration.
-   *
-   * The `sq` CLI calls `trailblaze --describe-commands` to discover subcommands
-   * and display them in `sq trailblaze` help output.
-   */
-  private fun describeCommands(): String {
-    data class CommandInfo(val name: String, val summary: String)
-
-    val commands = listOf(
-      CommandInfo("run", "Run a .trail.yaml file or directory of trail files on a connected device"),
-      CommandInfo("mcp", "Start the MCP server"),
-      CommandInfo("list-devices", "List all connected devices"),
-      CommandInfo("config", "View and modify Trailblaze configuration"),
-      CommandInfo("status", "Check if the Trailblaze daemon is running"),
-      CommandInfo("stop", "Stop the Trailblaze daemon"),
-      CommandInfo("help", "Display help information about the specified command"),
-    )
-
-    val commandsJson = commands.joinToString(",\n    ") { cmd ->
-      """{"name": "${cmd.name}", "summary": "${cmd.summary}"}"""
-    }
-
-    return """{
-  "name": "trailblaze",
-  "summary": "AI-powered UI automation",
-  "commands": [
-    $commandsJson
-  ]
-}"""
-  }
 }
 
 /** Provides the version string dynamically from [TrailblazeVersion]. */
@@ -690,57 +660,11 @@ class RunCommand : Callable<Int> {
       }
     })
 
-    // Start capture streams before the run (uses temp dir, moved to session dir after).
-    // Skip when delegating to a daemon — the daemon's DesktopYamlRunner handles capture,
-    // and running two screenrecord/simctl processes on the same device causes conflicts.
-    val isDelegatingToDaemon = true // This method is only called when delegating
-    val capturePlatform = driverType?.let { dt ->
-      TrailblazeDriverType.entries.find { it.name.equals(dt, ignoreCase = true) }?.platform?.name
-    } ?: "ANDROID"
-    val captureSession = if (isDelegatingToDaemon) null else CaptureSession.fromOptions(captureOptions, capturePlatform)
-    val captureTempDir = if (captureSession != null) {
-      val trailConfig = try { createTrailblazeYaml().extractTrailConfig(yamlContent) } catch (_: Exception) { null }
-      val appId = trailConfig?.app
-      val captureDeviceId = deviceId ?: run {
-        Console.log("Warning: no --device-id specified for capture, defaulting to emulator-5554")
-        "emulator-5554"
-      }
-      val tempDir = File(System.getProperty("java.io.tmpdir"), "trailblaze-capture-${System.currentTimeMillis()}")
-      tempDir.mkdirs()
-      captureSession.startAll(tempDir, captureDeviceId, appId)
-      tempDir
-    } else null
+    // Capture is handled by the daemon's DesktopYamlRunner — running two screenrecord/simctl
+    // processes on the same device causes conflicts, so we skip capture in the CLI delegate path.
 
     val response = daemon.run(request) { progress ->
       Console.info(progress)
-    }
-
-    // Stop captures and move artifacts into the session directory.
-    // Uses copyTo+delete as fallback because renameTo fails across filesystems
-    // (e.g., java.io.tmpdir on /var vs workspace on /Volumes in CI).
-    if (captureSession != null && captureTempDir != null) {
-      try {
-        val artifacts = captureSession.stopAll()
-        val sid = response.sessionId
-        if (sid != null && artifacts.isNotEmpty()) {
-          val sessionDir = File("logs", sid)
-          if (sessionDir.exists()) {
-            // Move all files from the capture temp dir (artifacts, metadata, sprite metadata, etc.)
-            captureTempDir.listFiles()?.forEach { file ->
-              val dest = File(sessionDir, file.name)
-              if (!moveFile(file, dest)) {
-                Console.info("Warning: failed to move ${file.name} to ${dest.absolutePath}")
-              } else {
-                Console.info("Capture: ${file.name} -> ${dest.absolutePath}")
-              }
-            }
-          } else {
-            Console.info("Warning: session directory does not exist: ${sessionDir.absolutePath}")
-          }
-        }
-      } finally {
-        captureTempDir.deleteRecursively()
-      }
     }
 
     if (response.success) {
@@ -891,7 +815,7 @@ class RunCommand : Callable<Int> {
     // Resolve driver type: CLI --driver flag overrides trail config driver field.
     val driverString = driverType ?: trailConfig?.driver
     val trailDriverType = driverString?.let { ds ->
-      TrailblazeDriverType.entries.find { it.name.equals(ds, ignoreCase = true) }
+      TrailblazeDriverType.fromString(ds)
         ?: run {
           Console.error("Error: Unknown driver type '$ds'.")
           Console.error("Valid driver types: ${TrailblazeDriverType.entries.joinToString { it.name }}")
@@ -901,9 +825,7 @@ class RunCommand : Callable<Int> {
 
     // Derive platform: driver takes precedence, then fall back to config platform string.
     val trailPlatform = trailDriverType?.platform
-      ?: trailConfig?.platform?.let { platformStr ->
-        TrailblazeDevicePlatform.entries.find { it.name.equals(platformStr, ignoreCase = true) }
-      }
+      ?: trailConfig?.platform?.let { TrailblazeDevicePlatform.fromString(it) }
 
     val isComposeTrail = trailDriverType == TrailblazeDriverType.COMPOSE
 
@@ -1061,7 +983,7 @@ class RunCommand : Callable<Int> {
       testName = testName,
       yaml = yamlContent,
       trailFilePath = file.absolutePath,
-      targetAppName = null,
+      targetAppName = trailConfig?.app,
       useRecordedSteps = effectiveUseRecordedSteps,
       trailblazeDeviceId = targetDevice.trailblazeDeviceId,
       trailblazeLlmModel = llmModel,
@@ -1078,9 +1000,11 @@ class RunCommand : Callable<Int> {
     val completionLatch = CountDownLatch(1)
     var exitCode = CommandLine.ExitCode.OK
 
-    // Use the currently selected target app from settings so that custom tools
-    // (e.g., myApp_launchSignedIn) are available during YAML deserialization & execution.
-    val targetTestApp = app.deviceManager.getCurrentSelectedTargetApp()
+    // Resolve target app: prefer trail config's `app` field, fall back to settings selection.
+    // This ensures custom tools (e.g., myApp_launchSignedIn) are registered for the
+    // correct app even when the desktop UI has a different app selected.
+    val targetTestApp = trailConfig?.app?.let { config.availableAppTargets.findById(it) }
+      ?: app.deviceManager.getCurrentSelectedTargetApp()
     if (verbose) {
       Console.log("Target app: ${targetTestApp?.displayName ?: "None (using built-in tools only)"}")
     }
@@ -1436,7 +1360,8 @@ class RunCommand : Callable<Int> {
 @Command(
   name = "mcp",
   mixinStandardHelpOptions = true,
-  description = ["Start the MCP server"]
+  description = ["Start the MCP server"],
+  subcommands = [McpInstallCommand::class]
 )
 class McpCommand : Callable<Int> {
 
@@ -1448,6 +1373,16 @@ class McpCommand : Callable<Int> {
     description = ["Use Streamable HTTP transport instead of STDIO. Starts a standalone HTTP MCP server."]
   )
   var http: Boolean = false
+
+  @Option(
+    names = ["--direct", "--no-daemon"],
+    description = [
+      "Run as an in-process MCP server over STDIO instead of the default proxy mode. " +
+        "Bypasses the Trailblaze daemon and runs everything in a single process. " +
+        "Use this for environments where the HTTP daemon cannot run."
+    ],
+  )
+  var direct: Boolean = false
 
   @Option(
     names = ["--tool-profile"],
@@ -1483,8 +1418,11 @@ class McpCommand : Callable<Int> {
         httpsPort = httpsPort,
         wait = true,
       )
-    } else {
-      // STDIO transport (default) — used by MCP client integrations.
+    } else if (direct) {
+      // Direct STDIO transport (opt-in via --direct/--no-daemon) — runs an in-process
+      // MCP server without the HTTP daemon proxy. Use for environments where the
+      // daemon cannot run.
+      //
       // Capture the current stdout BEFORE redirecting — DesktopLogFileWriter may have
       // already wrapped it with a tee (JSON-RPC goes to both stdout and log file).
       // After Console.useStdErr(), System.out is redirected to stderr, so we must
@@ -1501,7 +1439,7 @@ class McpCommand : Callable<Int> {
       // is now stderr, so DesktopLogFileWriter tees stderr→file (not the STDIO pipe).
       DesktopLogFileWriter.install(httpPort = parent.getEffectivePort())
 
-      Console.log("Trailblaze MCP server starting with STDIO transport (profile=${resolvedProfile.name})...")
+      Console.log("Trailblaze MCP server starting with direct STDIO transport (profile=${resolvedProfile.name})...")
 
       val app = parent.appProvider()
 
@@ -1564,6 +1502,10 @@ class McpCommand : Callable<Int> {
           )
         }
       }
+    } else {
+      // Default: STDIO-to-HTTP proxy mode — lightweight proxy that forwards JSON-RPC
+      // to the Trailblaze daemon. Reconnects transparently on daemon restarts.
+      return McpProxy(port = parent.getEffectivePort()).run()
     }
 
     return CommandLine.ExitCode.OK
