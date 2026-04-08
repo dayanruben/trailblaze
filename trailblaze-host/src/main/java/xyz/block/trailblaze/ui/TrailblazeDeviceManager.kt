@@ -68,6 +68,8 @@ import xyz.block.trailblaze.host.rules.BasePlaywrightElectronTest
 import xyz.block.trailblaze.host.rules.BasePlaywrightNativeTest
 import xyz.block.trailblaze.util.Console
 import xyz.block.trailblaze.util.isMacOs
+import xyz.block.trailblaze.revyl.RevylCliClient
+import xyz.block.trailblaze.revyl.RevylScreenState
 
 /**
  * Manages device discovery, selection, and state across the application.
@@ -133,6 +135,8 @@ class TrailblazeDeviceManager(
           TrailblazeDriverType.PLAYWRIGHT_NATIVE,
           TrailblazeDriverType.PLAYWRIGHT_ELECTRON,
           TrailblazeDriverType.COMPOSE -> isWebMode
+          TrailblazeDriverType.REVYL_ANDROID,
+          TrailblazeDriverType.REVYL_IOS -> true
           else -> settingsRepo.getEnabledDriverTypes().contains(connectedDeviceSummary.trailblazeDriverType)
         }
       }
@@ -386,6 +390,14 @@ class TrailblazeDeviceManager(
         Console.log("⚠️ Screen state capture not supported for ${driverType.name} driver")
         null
       }
+      TrailblazeDriverType.REVYL_ANDROID,
+      TrailblazeDriverType.REVYL_IOS -> {
+        val platform = if (driverType == TrailblazeDriverType.REVYL_ANDROID) "android" else "ios"
+        RevylScreenState(
+          revylCliClient,
+          platform,
+        )
+      }
     }
   }
   
@@ -587,6 +599,42 @@ class TrailblazeDeviceManager(
             )
           )
         }
+
+        // Revyl cloud devices — default presets always included as fallbacks.
+        add(
+          TrailblazeConnectedDeviceSummary(
+            trailblazeDriverType = TrailblazeDriverType.REVYL_ANDROID,
+            instanceId = "revyl-android-phone",
+            description = "Revyl Android (Default)",
+          )
+        )
+        add(
+          TrailblazeConnectedDeviceSummary(
+            trailblazeDriverType = TrailblazeDriverType.REVYL_IOS,
+            instanceId = "revyl-ios-iphone",
+            description = "Revyl iOS (Default)",
+          )
+        )
+
+        // Dynamically register each model from the Revyl device catalog.
+        // Uses `revyl device targets --json` so the list stays in sync
+        // with the backend without code changes.
+        try {
+          val targets = revylCliClient.getDeviceTargets()
+          for (target in targets) {
+            val driverType = if (target.platform == "android")
+              TrailblazeDriverType.REVYL_ANDROID else TrailblazeDriverType.REVYL_IOS
+            add(
+              TrailblazeConnectedDeviceSummary(
+                trailblazeDriverType = driverType,
+                instanceId = "revyl-model:${target.model}::${target.osVersion}",
+                description = "Revyl ${target.model} (${target.osVersion})",
+              )
+            )
+          }
+        } catch (e: Exception) {
+          Console.log("Revyl device catalog unavailable: ${e.message}")
+        }
       }
 
       // Always filter for device state — all three Android driver variants share the same
@@ -704,6 +752,8 @@ class TrailblazeDeviceManager(
   fun getAllSupportedDriverTypes() = settingsRepo.getAllSupportedDriverTypes()
 
   fun getCurrentSelectedTargetApp(): TrailblazeHostAppTarget? = settingsRepo.getCurrentSelectedTargetApp()
+
+  private val revylCliClient: RevylCliClient by lazy { RevylCliClient() }
 
   // Store running test instances per device - allows forceful driver shutdown
   private val maestroDriverByDeviceMap: MutableMap<TrailblazeDeviceId, Driver> =

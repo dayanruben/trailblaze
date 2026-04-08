@@ -36,8 +36,12 @@ import xyz.block.trailblaze.devices.TrailblazeDevicePlatform
 import xyz.block.trailblaze.devices.TrailblazeDriverType
 import xyz.block.trailblaze.exception.TrailblazeException
 import xyz.block.trailblaze.exception.TrailblazeSessionCancelledException
-import xyz.block.trailblaze.host.ios.MobileDeviceUtils
 import xyz.block.trailblaze.host.golden.SnapshotGoldenComparison
+import xyz.block.trailblaze.host.ios.MobileDeviceUtils
+import xyz.block.trailblaze.host.revyl.RevylTrailblazeAgent
+import xyz.block.trailblaze.revyl.RevylCliClient
+import xyz.block.trailblaze.revyl.RevylScreenState
+import xyz.block.trailblaze.revyl.RevylSession
 import xyz.block.trailblaze.host.rules.BaseComposeTest
 import xyz.block.trailblaze.host.rules.BaseHostTrailblazeTest
 import xyz.block.trailblaze.host.rules.BasePlaywrightElectronTest
@@ -73,8 +77,10 @@ import xyz.block.trailblaze.ui.TrailblazeDeviceManager
 import xyz.block.trailblaze.util.Console
 import xyz.block.trailblaze.util.GitUtils
 import xyz.block.trailblaze.util.HostAndroidDeviceConnectUtils
+import xyz.block.trailblaze.yaml.DirectionStep
 import xyz.block.trailblaze.yaml.ElectronAppConfig
 import xyz.block.trailblaze.yaml.TrailYamlItem
+import xyz.block.trailblaze.yaml.VerificationStep
 import xyz.block.trailblaze.yaml.createTrailblazeYaml
 
 object TrailblazeHostYamlRunner {
@@ -143,6 +149,9 @@ object TrailblazeHostYamlRunner {
         runPlaywrightElectronYaml(dynamicLlmClient, runOnHostParams, deviceManager)
       TrailblazeDriverType.COMPOSE ->
         runComposeYaml(dynamicLlmClient, runOnHostParams, deviceManager)
+      TrailblazeDriverType.REVYL_ANDROID,
+      TrailblazeDriverType.REVYL_IOS ->
+        runRevylYaml(dynamicLlmClient, runOnHostParams, deviceManager)
       else ->
         runMaestroHostYaml(dynamicLlmClient, runOnHostParams, deviceManager)
     }
@@ -692,6 +701,273 @@ object TrailblazeHostYamlRunner {
       agent.close()
       deviceManager.cancelSessionForDevice(trailblazeDeviceId)
       Console.log("🏁 Finally block completed for Compose RPC device: ${trailblazeDeviceId.instanceId}")
+    }
+  }
+
+  /**
+   * Revyl cloud device path: provisions a device via [RevylCliClient] and runs
+   * the trail using [RevylTrailblazeAgent] with standard mobile tools.
+   *
+   * The CLI handles device provisioning, app install, and AI-powered target
+   * grounding. Screenshots come from [RevylScreenState].
+   */
+  private suspend fun runRevylYaml(
+    dynamicLlmClient: DynamicLlmClient,
+    runOnHostParams: RunOnHostParams,
+    deviceManager: TrailblazeDeviceManager,
+  ): SessionId? {
+    val onProgressMessage = runOnHostParams.onProgressMessage
+    val runYamlRequest = runOnHostParams.runYamlRequest
+    val trailblazeDeviceId = runYamlRequest.trailblazeDeviceId
+    val platform = if (runOnHostParams.trailblazeDriverType == TrailblazeDriverType.REVYL_ANDROID) "android" else "ios"
+
+    val instanceId = trailblazeDeviceId.instanceId
+    val deviceLabel = if (instanceId.startsWith("revyl-model:"))
+      instanceId.removePrefix("revyl-model:") else "$platform (default)"
+
+    if (System.getenv(RevylCliClient.REVYL_API_KEY_ENV).isNullOrBlank()) {
+      onProgressMessage("Error: ${RevylCliClient.REVYL_API_KEY_ENV} is not set. Configure it in Settings → Environment Variables.")
+      return null
+    }
+
+    onProgressMessage("Provisioning Revyl cloud $deviceLabel...")
+
+    val cliClient: RevylCliClient
+    val session: RevylSession
+    try {
+      cliClient = RevylCliClient()
+      session = if (instanceId.startsWith("revyl-model:")) {
+        val payload = instanceId.removePrefix("revyl-model:")
+        val parts = payload.split("::", limit = 2)
+        val modelName = parts[0]
+        val osVer = parts.getOrNull(1)?.takeIf { it.isNotBlank() }
+        if (osVer != null) {
+          cliClient.startSession(platform = platform, deviceModel = modelName, osVersion = osVer)
+        } else {
+          Console.log("RevylYaml: device '$modelName' missing OS version — using platform default")
+          cliClient.startSession(platform = platform)
+        }
+      } else {
+        cliClient.startSession(platform = platform)
+      }
+    } catch (e: Exception) {
+      Console.log("Revyl session provisioning failed: ${e::class.simpleName}: ${e.message}")
+      onProgressMessage("Error: ${e.message}")
+      return null
+    }
+    onProgressMessage("Revyl $deviceLabel ready — viewer: ${session.viewerUrl}")
+
+    // Outer try-finally guarantees the cloud device is stopped even if setup
+    // (e.g. LLM client creation) fails before the inner execution try block.
+    try {
+      val trailblazeDeviceInfo = TrailblazeDeviceInfo(
+        trailblazeDeviceId = trailblazeDeviceId,
+        trailblazeDriverType = runOnHostParams.trailblazeDriverType,
+        widthPixels = session.screenWidth.takeIf { it > 0 }
+          ?: xyz.block.trailblaze.revyl.RevylDefaults.dimensionsForPlatform(platform).first,
+        heightPixels = session.screenHeight.takeIf { it > 0 }
+          ?: xyz.block.trailblaze.revyl.RevylDefaults.dimensionsForPlatform(platform).second,
+        metadata = mapOf("revyl_viewer_url" to session.viewerUrl),
+        classifiers = listOf(
+          TrailblazeDeviceClassifier(platform),
+          TrailblazeDeviceClassifier("revyl-cloud"),
+        ),
+      )
+
+      val screenStateProvider: () -> ScreenState = {
+        RevylScreenState(cliClient, platform, session.screenWidth, session.screenHeight)
+      }
+
+      TrailblazeJsonInstance = TrailblazeJson.createTrailblazeJsonInstance(
+        allToolClasses = TrailblazeToolSet.AllBuiltInTrailblazeToolsForSerializationByToolName +
+          xyz.block.trailblaze.revyl.tools.RevylNativeToolSet.RevylLlmToolSet.toolClasses.associateBy { it.toolName() },
+      )
+
+      val loggingRule = HostTrailblazeLoggingRule(
+        trailblazeDeviceInfoProvider = { trailblazeDeviceInfo },
+      )
+
+      val agent = RevylTrailblazeAgent(
+        cliClient = cliClient,
+        platform = platform,
+        trailblazeLogger = loggingRule.logger,
+        trailblazeDeviceInfoProvider = { trailblazeDeviceInfo },
+        sessionProvider = {
+          loggingRule.session ?: error("Session not available - ensure test is running")
+        },
+      )
+
+      val toolRepo = TrailblazeToolRepo(
+        xyz.block.trailblaze.revyl.tools.RevylNativeToolSet.RevylLlmToolSet,
+      )
+
+      val trailblazeRunner = TrailblazeRunner(
+        screenStateProvider = screenStateProvider,
+        agent = agent,
+        llmClient = dynamicLlmClient.createLlmClient(),
+        trailblazeLlmModel = runYamlRequest.trailblazeLlmModel,
+        trailblazeToolRepo = toolRepo,
+        trailblazeLogger = loggingRule.logger,
+        sessionProvider = {
+          loggingRule.session ?: error("Session not available - ensure test is running")
+        },
+      )
+
+      val elementComparator = TrailblazeElementComparator(
+        screenStateProvider = screenStateProvider,
+        llmClient = dynamicLlmClient.createLlmClient(),
+        trailblazeLlmModel = runYamlRequest.trailblazeLlmModel,
+        toolRepo = toolRepo,
+      )
+
+      val trailblazeYaml = createTrailblazeYaml(
+        customTrailblazeToolClasses = xyz.block.trailblaze.revyl.tools.RevylNativeToolSet.RevylLlmToolSet.toolClasses,
+      )
+
+      val trailblazeRunnerUtil = TrailblazeRunnerUtil(
+        trailblazeRunner = trailblazeRunner,
+        runTrailblazeTool = { trailblazeTools: List<TrailblazeTool> ->
+          val result = agent.runTrailblazeTools(
+            trailblazeTools,
+            null,
+            screenState = screenStateProvider(),
+            elementComparator = elementComparator,
+            screenStateProvider = screenStateProvider,
+          )
+          when (val toolResult = result.result) {
+            is TrailblazeToolResult.Success -> toolResult
+            is TrailblazeToolResult.Error -> throw TrailblazeException(toolResult.errorMessage)
+          }
+        },
+        trailblazeLogger = loggingRule.logger,
+        sessionProvider = {
+          loggingRule.session ?: error("Session not available - ensure test is running")
+        },
+      )
+
+      val sessionManager = loggingRule.sessionManager
+
+      val overrideSessionId = runYamlRequest.config.overrideSessionId
+      val trailblazeSession = if (overrideSessionId != null) {
+        sessionManager.createSessionWithId(overrideSessionId)
+      } else {
+        sessionManager.startSession(runYamlRequest.testName)
+      }
+      loggingRule.setSession(trailblazeSession)
+
+      return try {
+        onProgressMessage("Executing YAML test via Revyl cloud device...")
+        Console.log("Starting Revyl execution for device: ${trailblazeDeviceId.instanceId}")
+
+        val trailItems: List<TrailYamlItem> = trailblazeYaml.decodeTrail(runYamlRequest.yaml)
+        val trailConfig = trailblazeYaml.extractTrailConfig(trailItems)
+
+        if (runYamlRequest.config.sendSessionStartLog) {
+          loggingRule.logger.log(
+            trailblazeSession,
+            TrailblazeLog.TrailblazeSessionStatusChangeLog(
+              sessionStatus = SessionStatus.Started(
+                trailConfig = trailConfig,
+                trailFilePath = runYamlRequest.trailFilePath,
+                testClassName = "Revyl",
+                testMethodName = "run",
+                trailblazeDeviceInfo = trailblazeDeviceInfo,
+                rawYaml = runYamlRequest.yaml,
+                hasRecordedSteps = trailblazeYaml.hasRecordedSteps(trailItems),
+                trailblazeDeviceId = trailblazeDeviceId,
+              ),
+              session = trailblazeSession.sessionId,
+              timestamp = Clock.System.now(),
+            ),
+          )
+        }
+
+        val useRevylNativeSteps = runYamlRequest.config.useRevylNativeSteps
+        for (item in trailItems) {
+          val itemResult = when (item) {
+            is TrailYamlItem.PromptsTrailItem -> {
+              if (useRevylNativeSteps) {
+                for (prompt in item.promptSteps) {
+                  when (prompt) {
+                    is VerificationStep -> {
+                      Console.log("RevylYaml: validation — '${prompt.verify}'")
+                      val result = cliClient.validation(prompt.verify)
+                      if (!result.success) {
+                        throw TrailblazeException(
+                          "Validation failed: ${prompt.verify}" +
+                            (result.statusReason?.let { " — $it" } ?: ""),
+                        )
+                      }
+                    }
+                    is DirectionStep -> {
+                      Console.log("RevylYaml: instruction — '${prompt.step}'")
+                      val result = cliClient.instruction(prompt.step)
+                      if (!result.success) {
+                        throw TrailblazeException(
+                          "Instruction failed: ${prompt.step}" +
+                            (result.statusReason?.let { " — $it" } ?: ""),
+                        )
+                      }
+                    }
+                  }
+                }
+                TrailblazeToolResult.Success()
+              } else {
+                trailblazeRunnerUtil.runPromptSuspend(item.promptSteps, runYamlRequest.useRecordedSteps)
+              }
+            }
+            is TrailYamlItem.ToolTrailItem ->
+              trailblazeRunnerUtil.runTrailblazeTool(item.tools.map { it.trailblazeTool })
+            is TrailYamlItem.ConfigTrailItem ->
+              item.config.context?.let { trailblazeRunner.appendToSystemPrompt(it) }
+          }
+          if (itemResult is TrailblazeToolResult.Error) {
+            throw TrailblazeException(itemResult.errorMessage)
+          }
+        }
+
+        Console.log("Revyl execution completed for device: ${trailblazeDeviceId.instanceId}")
+        onProgressMessage("Test execution completed successfully")
+
+        if (runYamlRequest.config.sendSessionEndLog) {
+          sessionManager.endSession(trailblazeSession, isSuccess = true)
+        }
+
+        generateAndSaveRecording(
+          sessionId = trailblazeSession.sessionId,
+          customToolClasses = xyz.block.trailblaze.revyl.tools.RevylNativeToolSet.RevylLlmToolSet.toolClasses,
+        )
+
+        trailblazeSession.sessionId
+      } catch (e: TrailblazeSessionCancelledException) {
+        Console.log("TrailblazeSessionCancelledException caught for device: ${trailblazeDeviceId.instanceId}")
+        onProgressMessage("Test session cancelled")
+        null
+      } catch (e: CancellationException) {
+        Console.log("CancellationException caught for device: ${trailblazeDeviceId.instanceId} - ${e.message}")
+        onProgressMessage("Test execution cancelled")
+        throw e
+      } catch (e: Exception) {
+        Console.log("Exception caught in runRevylYaml for device: ${trailblazeDeviceId.instanceId} - ${e::class.simpleName}: ${e.message}")
+        onProgressMessage("Test execution failed: ${e.message}")
+        captureFailureScreenshot(trailblazeSession, loggingRule, screenStateProvider)
+        sessionManager.endSession(trailblazeSession, isSuccess = false, exception = e)
+        null
+      } finally {
+        Console.log("Finally block executing for Revyl device: ${trailblazeDeviceId.instanceId}")
+        exportAndSaveTrace(trailblazeSession.sessionId, loggingRule)
+        loggingRule.setSession(null)
+        deviceManager.cancelSessionForDevice(trailblazeDeviceId)
+        Console.log("Finally block completed for Revyl device: ${trailblazeDeviceId.instanceId}")
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      Console.log("Revyl setup failed for device: ${trailblazeDeviceId.instanceId} - ${e::class.simpleName}: ${e.message}")
+      onProgressMessage("Error: ${e.message}")
+      return null
+    } finally {
+      try { cliClient.stopSession() } catch (_: Exception) { }
     }
   }
 

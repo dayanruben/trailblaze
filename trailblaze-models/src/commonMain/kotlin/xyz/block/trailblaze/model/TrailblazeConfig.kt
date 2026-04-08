@@ -45,6 +45,11 @@ enum class NodeSelectorMode {
  *                      if false, disables AI fallback (useful for debugging recorded steps).
  * @property browserHeadless If true, the Playwright browser runs headless (no visible window);
  *                           if false, the browser window is shown on screen.
+ * @property useRevylNativeSteps If true, Revyl device prompt steps use
+ *                               `revyl device instruction` / `validation` instead of the
+ *                               LLM agent pipeline. Defaults to false (LLM pipeline) until
+ *                               native step reporting with screenshots is implemented.
+ *                               Only affects REVYL_ANDROID/REVYL_IOS drivers.
  */
 @Serializable
 data class TrailblazeConfig(
@@ -55,6 +60,7 @@ data class TrailblazeConfig(
   val overrideSessionId: SessionId? = null,
   val aiFallback: Boolean = AI_FALLBACK_DEFAULT,
   val browserHeadless: Boolean = true,
+  val useRevylNativeSteps: Boolean = false,
   val nodeSelectorMode: NodeSelectorMode = FORCE_LEGACY,
 ) {
   companion object {

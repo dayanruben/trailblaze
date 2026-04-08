@@ -13,6 +13,7 @@ import xyz.block.trailblaze.llm.providers.OpenRouterTrailblazeLlmModelList
 import xyz.block.trailblaze.mcp.utils.JvmLLMProvidersUtil
 import xyz.block.trailblaze.model.TrailblazeHostAppTarget
 import xyz.block.trailblaze.report.utils.LogsRepo
+import xyz.block.trailblaze.revyl.RevylCliClient
 import xyz.block.trailblaze.ui.TrailblazeDesktopUtil
 import xyz.block.trailblaze.ui.TrailblazeSettingsRepo
 import xyz.block.trailblaze.ui.models.AppIconProvider
@@ -35,6 +36,8 @@ class OpenSourceTrailblazeDesktopAppConfig : TrailblazeDesktopAppConfig(
     TrailblazeDriverType.IOS_HOST,
     TrailblazeDriverType.PLAYWRIGHT_NATIVE,
     TrailblazeDriverType.PLAYWRIGHT_ELECTRON,
+    TrailblazeDriverType.REVYL_ANDROID,
+    TrailblazeDriverType.REVYL_IOS,
   )
 
   // Start with no platforms enabled by default - user must explicitly enable them
@@ -76,7 +79,7 @@ class OpenSourceTrailblazeDesktopAppConfig : TrailblazeDesktopAppConfig(
     ALL_MODEL_LISTS.mapNotNull { trailblazeLlmModelList ->
       val trailblazeLlmProvider = trailblazeLlmModelList.provider
       JvmLLMProvidersUtil.getEnvironmentVariableKeyForLlmProvider(trailblazeLlmProvider)
-    }
+    } + RevylCliClient.REVYL_API_KEY_ENV
 
   override fun getCurrentlyAvailableLlmModelLists(): Set<TrailblazeLlmModelList> {
     val modelLists = JvmLLMProvidersUtil.getAvailableTrailblazeLlmProviderModelLists(ALL_MODEL_LISTS)

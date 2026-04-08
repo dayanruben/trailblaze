@@ -38,6 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -156,6 +157,22 @@ internal fun SessionDetailHeader(
               style = MaterialTheme.typography.labelSmall,
               color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
             )
+          }
+          val externalLinks = extractExternalLinks(sessionDetail.session.trailblazeDeviceInfo)
+          if (externalLinks.isNotEmpty()) {
+            val uriHandler = LocalUriHandler.current
+            for (link in externalLinks) {
+              TextButton(
+                onClick = { uriHandler.openUri(link.url) },
+                contentPadding = ButtonDefaults.TextButtonContentPadding,
+              ) {
+                Text(
+                  text = link.label,
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.primary,
+                )
+              }
+            }
           }
         }
       }
