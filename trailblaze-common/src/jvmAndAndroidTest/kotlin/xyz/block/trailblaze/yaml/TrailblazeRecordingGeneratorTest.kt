@@ -17,6 +17,8 @@ import xyz.block.trailblaze.logs.model.TaskId
 import xyz.block.trailblaze.logs.client.TrailblazeLog
 import xyz.block.trailblaze.logs.model.SessionId
 import xyz.block.trailblaze.toolcalls.TrailblazeToolResult
+import xyz.block.trailblaze.toolcalls.toLogPayload
+import xyz.block.trailblaze.toolcalls.toLogPayloads
 import xyz.block.trailblaze.toolcalls.commands.AssertVisibleBySelectorTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.AssertVisibleWithTextTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.InputTextTrailblazeTool
@@ -24,7 +26,9 @@ import xyz.block.trailblaze.toolcalls.commands.LaunchAppTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.PasteClipboardTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.SwipeTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.TapOnByElementSelector
+import xyz.block.trailblaze.toolcalls.commands.TapTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.WaitForIdleSyncTrailblazeTool
+import xyz.block.trailblaze.toolcalls.getIsRecordableFromAnnotation
 
 /**
  * Tests for [generateRecordedYaml] — the recording generator that transforms
@@ -83,8 +87,9 @@ class TrailblazeRecordingGeneratorTest {
     tool: xyz.block.trailblaze.toolcalls.TrailblazeTool,
     toolName: String,
     isRecordable: Boolean = true,
+    isTopLevelToolCall: Boolean = false,
   ) = TrailblazeLog.TrailblazeToolLog(
-    trailblazeTool = tool,
+    trailblazeTool = tool.toLogPayload(),
     toolName = toolName,
     successful = true,
     traceId = null,
@@ -92,6 +97,7 @@ class TrailblazeRecordingGeneratorTest {
     session = testSession,
     timestamp = now,
     isRecordable = isRecordable,
+    isTopLevelToolCall = isTopLevelToolCall,
   )
 
   private fun delegatingToolLog(
@@ -99,9 +105,9 @@ class TrailblazeRecordingGeneratorTest {
     toolName: String,
     executableTools: List<xyz.block.trailblaze.toolcalls.TrailblazeTool> = emptyList(),
   ) = TrailblazeLog.DelegatingTrailblazeToolLog(
-    trailblazeTool = tool,
+    trailblazeTool = tool.toLogPayload(),
     toolName = toolName,
-    executableTools = executableTools,
+    executableTools = executableTools.toLogPayloads(),
     session = testSession,
     timestamp = now,
     traceId = null,
@@ -127,6 +133,32 @@ class TrailblazeRecordingGeneratorTest {
       |      tools:
       |      - inputText:
       |          text: hello
+    """.trimMargin() + "\n"
+    assertThat(yaml).isEqualTo(expected)
+  }
+
+  @Test
+  fun emptyObjectiveWindowGeneratesAutoSatisfiedRecording() {
+    // The recording author observed: this objective was already complete from the prior step's
+    // actions, so zero recordable tools fired during the window. The generator must emit an
+    // explicit `autoSatisfied: true` marker so replay skips the step deterministically instead
+    // of falling through to AI.
+    val step = DirectionStep(step = "Confirm closing the dialog")
+    val logs = listOf(
+      objectiveStart(step),
+      // No tool logs in this window — the prior step's actions already satisfied the objective.
+      objectiveComplete(step),
+    )
+
+    val yaml = logs.generateRecordedYaml(trailblazeYaml)
+
+    // YamlConfiguration has encodeDefaults=false, so the default `tools: []` is omitted.
+    // Only the non-default `autoSatisfied: true` flag appears in the encoded YAML.
+    val expected = """
+      |- prompts:
+      |  - step: Confirm closing the dialog
+      |    recording:
+      |      autoSatisfied: true
     """.trimMargin() + "\n"
     assertThat(yaml).isEqualTo(expected)
   }
@@ -208,6 +240,98 @@ class TrailblazeRecordingGeneratorTest {
     val prompts = decoded[0] as TrailYamlItem.PromptsTrailItem
     assertThat(prompts.promptSteps[0].recording!!.tools.size).isEqualTo(1)
     assertThat(prompts.promptSteps[0].recording!!.tools[0].name).isEqualTo("tapOnElementBySelector")
+  }
+
+  /**
+   * Regression: `tap { ref }` is a snapshot-scoped, ephemeral identifier. The `tap` tool
+   * (`TapTrailblazeTool`) is a `DelegatingTrailblazeTool` whose only role is to expand the
+   * ref into a durable selector at execution time. It must never persist into a recording —
+   * refs are content-hashed against the live snapshot and meaningless on replay.
+   *
+   * **How the bug manifested.** The MCP `step` flow emits two log entries per LLM tool call:
+   * (a) the dispatcher's `TapOnByElementSelector` `TrailblazeToolLog` (`isTopLevelToolCall =
+   * false`), and (b) `StepToolSet.emitDirectToolLog`'s log of the *raw* tool the LLM asked
+   * for (`isTopLevelToolCall = true`, `isRecordable` from the annotation). The recorder's
+   * window-selection rule prefers top-level logs when present
+   * (`toolLogsInWindow.filter { it.isTopLevelToolCall }.ifEmpty { toolLogsInWindow }`), so
+   * with the previous default `isRecordable = true` on `TapTrailblazeTool` the ref-bearing
+   * log won the filter and the selector log was dropped. Marking the tool non-recordable
+   * removes (b) from the recordable set, so the `ifEmpty` branch falls back to the
+   * selector log and the YAML carries the durable selector instead.
+   */
+  @Test
+  fun tapTrailblazeToolWithRefIsNeverRecorded() {
+    // (1) Annotation contract: log-construction helpers stamp `isRecordable = false` on any
+    // log entry that wraps a TapTrailblazeTool — including StepToolSet.emitDirectToolLog
+    // (which reads getIsRecordableFromAnnotation()).
+    assertThat(TapTrailblazeTool(ref = "h801").getIsRecordableFromAnnotation()).isEqualTo(false)
+
+    // (2) End-to-end: reproduce the exact two-log shape the MCP step path produces and
+    // verify the recorder picks the durable selector, not the ref. The top-level
+    // tap{ref} entry must be filtered out by the recordable bit so the selector log
+    // (which is `isTopLevelToolCall = false`) wins via the `ifEmpty` fallback.
+    val step = DirectionStep(step = "Choose sign in with email")
+    val logs = listOf(
+      objectiveStart(step),
+      // Selector log emitted by the dispatcher after `executeDelegatingTool` expands the
+      // tap. Not a top-level call — it's the dispatcher's translation of the LLM's call.
+      toolLog(
+        TapOnByElementSelector(
+          reason = "Tap sign-in-with-email row",
+          selector = TrailblazeElementSelector(textRegex = "Sign in with email"),
+        ),
+        "tapOnElementBySelector",
+        isTopLevelToolCall = false,
+      ),
+      // Top-level log emitted by StepToolSet.emitDirectToolLog with the raw LLM call.
+      // Pre-fix this had `isRecordable = true` (annotation default) and shadowed the
+      // selector log; post-fix the annotation forces `isRecordable = false`.
+      toolLog(
+        TapTrailblazeTool(ref = "h801"),
+        "tap",
+        isRecordable = false,
+        isTopLevelToolCall = true,
+      ),
+      objectiveComplete(step),
+    )
+
+    val yaml = logs.generateRecordedYaml(trailblazeYaml)
+
+    assertThat(yaml).doesNotContain("ref: h801")
+    val decoded = trailblazeYaml.decodeTrail(yaml)
+    val prompts = decoded[0] as TrailYamlItem.PromptsTrailItem
+    val recordedNames = prompts.promptSteps[0].recording!!.tools.map { it.name }
+    assertThat(recordedNames).isEqualTo(listOf("tapOnElementBySelector"))
+  }
+
+  @Test
+  fun topLevelDirectToolLogsArePreferredOverExecutorLogs() {
+    val step = DirectionStep(step = "Create contact through scripted tool")
+    val logs = listOf(
+      objectiveStart(step),
+      toolLog(
+        tool = xyz.block.trailblaze.logs.client.temp.OtherTrailblazeTool(
+          toolName = "ios_contacts_create_contact",
+          raw = JsonObject(
+            mapOf(
+              "firstName" to JsonPrimitive("Trailblaze"),
+              "lastName" to JsonPrimitive("Codex0426"),
+            ),
+          ),
+        ),
+        toolName = "ios_contacts_create_contact",
+        isTopLevelToolCall = true,
+      ),
+      toolLog(LaunchAppTrailblazeTool(appId = "com.apple.MobileAddressBook"), "launchApp"),
+      toolLog(InputTextTrailblazeTool(text = "Trailblaze"), "inputText"),
+      objectiveComplete(step),
+    )
+
+    val yaml = logs.generateRecordedYaml(trailblazeYaml)
+
+    assertThat(yaml).contains("ios_contacts_create_contact")
+    assertThat(yaml).doesNotContain("launchApp")
+    assertThat(yaml).doesNotContain("inputText")
   }
 
   @Test
@@ -332,11 +456,11 @@ class TrailblazeRecordingGeneratorTest {
   }
 
   @Test
-  fun emptyObjectiveWindowProducesPromptWithoutRecording() {
+  fun emptyObjectiveWindowProducesAutoSatisfiedRecording() {
     val step = DirectionStep(step = "Wait for screen")
     val logs = listOf(
       objectiveStart(step),
-      // No tool logs within the window
+      // No tool logs within the window — the prior step's actions already satisfied this objective.
       objectiveComplete(step),
     )
 
@@ -346,7 +470,12 @@ class TrailblazeRecordingGeneratorTest {
     assertThat(decoded.size).isEqualTo(1)
     val prompts = decoded[0] as TrailYamlItem.PromptsTrailItem
     assertThat(prompts.promptSteps[0].prompt).isEqualTo("Wait for screen")
-    assertThat(prompts.promptSteps[0].recording).isEqualTo(null)
+    // After the auto_satisfied marker change, an empty window emits an explicit
+    // `recording: { autoSatisfied: true }` rather than `null`. Replay skips this step
+    // deterministically — see ToolRecording KDoc for the contract.
+    assertThat(prompts.promptSteps[0].recording).isEqualTo(
+      ToolRecording(tools = emptyList(), autoSatisfied = true),
+    )
   }
 
   /**
@@ -730,7 +859,7 @@ class TrailblazeRecordingGeneratorTest {
         trailblazeTool = TapOnByElementSelector(
           reason = "Tap button",
           selector = TrailblazeElementSelector(textRegex = "Submit"),
-        ),
+        ).toLogPayload(),
         toolName = "tapOnElementBySelector",
         successful = false,
         exceptionMessage = "Element not found",
