@@ -5,6 +5,8 @@ import assertk.assertions.containsExactly
 import assertk.assertions.hasSize
 import assertk.assertions.isEqualTo
 import assertk.assertions.isInstanceOf
+import assertk.assertions.isNotNull
+import assertk.assertions.isNull
 import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
 import xyz.block.trailblaze.api.ScreenState
@@ -19,7 +21,12 @@ import xyz.block.trailblaze.logs.model.SessionId
 import xyz.block.trailblaze.logs.model.TraceId
 import xyz.block.trailblaze.toolcalls.DelegatingTrailblazeTool
 import xyz.block.trailblaze.toolcalls.ExecutableTrailblazeTool
+import xyz.block.trailblaze.logs.client.LogEmitter
+import xyz.block.trailblaze.logs.client.ScreenStateLogger
+import xyz.block.trailblaze.logs.client.TrailblazeLog
 import xyz.block.trailblaze.toolcalls.HostLocalExecutableTrailblazeTool
+import xyz.block.trailblaze.toolcalls.RecordableHostLocalTool
+import xyz.block.trailblaze.toolcalls.ToolExecutionContextThreadLocal
 import xyz.block.trailblaze.toolcalls.TrailblazeTool
 import xyz.block.trailblaze.toolcalls.TrailblazeToolClass
 import xyz.block.trailblaze.toolcalls.TrailblazeToolExecutionContext
@@ -336,5 +343,126 @@ class BaseTrailblazeAgentTest {
     assertThat(result.result).isInstanceOf(TrailblazeToolResult.Success::class)
     assertThat(result.executedTools).containsExactly(t1, hostLocal, memTool, t2)
     assertThat(hostLocal.executeCount).isEqualTo(1)
+  }
+
+  // ── ToolExecutionContextThreadLocal install/clear (PR #2756 lead-dev review #5) ──
+
+  @Test
+  fun `runTrailblazeTools clears the ToolExecutionContextThreadLocal slot after a successful batch`() {
+    // Pins the `try { install } finally { clear }` wrapper added in #2749. A leaked slot
+    // would let a later batch on the same thread observe a stale context.
+    ToolExecutionContextThreadLocal.clear() // defensive: start clean
+    val agent = TestAgent()
+    val result = run(agent, StubTool(), StubTool())
+
+    assertThat(result.result).isInstanceOf(TrailblazeToolResult.Success::class)
+    assertThat(ToolExecutionContextThreadLocal.get()).isNull()
+  }
+
+  @Test
+  fun `runTrailblazeTools clears the ToolExecutionContextThreadLocal slot when a tool returns failure`() {
+    // The early-return path on first failure must still hit the `finally` and clear the
+    // slot. Without `try/finally` the outer return would skip the clear.
+    ToolExecutionContextThreadLocal.clear()
+    val agent = TestAgent()
+    val failing = StubTool(
+      result = TrailblazeToolResult.Error.ExceptionThrown(
+        errorMessage = "boom",
+        command = StubTool(),
+        stackTrace = "",
+      ),
+    )
+    val neverRuns = StubTool()
+
+    val result = run(agent, failing, neverRuns)
+
+    assertThat(result.result).isInstanceOf(TrailblazeToolResult.Error::class)
+    assertThat(ToolExecutionContextThreadLocal.get()).isNull()
+  }
+
+  @Test
+  fun `back-to-back batches on the same thread see their own freshly-installed context`() {
+    // Closes the leak loop: prove the slot is freed between batches AND that the second
+    // batch's install isn't observing the first batch's context. We capture the slot
+    // value during each batch via a sentinel host-local tool that records what
+    // ToolExecutionContextThreadLocal.get() returns at execute time.
+    ToolExecutionContextThreadLocal.clear()
+
+    val captured = mutableListOf<TrailblazeToolExecutionContext?>()
+
+    class SnapshotTool : HostLocalExecutableTrailblazeTool {
+      override val advertisedToolName: String = "snapshot_tool"
+      override suspend fun execute(
+        toolExecutionContext: TrailblazeToolExecutionContext,
+      ): TrailblazeToolResult {
+        captured += ToolExecutionContextThreadLocal.get()
+        return TrailblazeToolResult.Success()
+      }
+    }
+
+    val agent = TestAgent()
+    run(agent, SnapshotTool())
+    run(agent, SnapshotTool())
+
+    // Both batches saw a non-null context (their own install) at execute time.
+    assertThat(captured).hasSize(2)
+    assertThat(captured[0]).isNotNull()
+    assertThat(captured[1]).isNotNull()
+    // The two captured contexts MUST be different instances — if they were equal,
+    // the second batch was reading a stale slot from the first batch's leaked install.
+    assertThat(captured[0] === captured[1]).isEqualTo(false)
+    // After both batches, the slot is cleared again.
+    assertThat(ToolExecutionContextThreadLocal.get()).isNull()
+  }
+
+  // ── RecordableHostLocalTool: opt-in logging for host-local provisioning tools ──
+
+  private fun capturingAgent(captured: MutableList<TrailblazeLog>): TestAgent =
+    object : TestAgent() {
+      override val trailblazeLogger: TrailblazeLogger = TrailblazeLogger(
+        logEmitter = LogEmitter { log -> captured.add(log) },
+        screenStateLogger = ScreenStateLogger { "" },
+      )
+    }
+
+  @Serializable
+  @TrailblazeToolClass("recordable_stub")
+  private class RecordableStubTool(
+    val outputValue: String? = null,
+  ) : RecordableHostLocalTool {
+    override val advertisedToolName: String = "recordable_stub"
+    override suspend fun execute(
+      toolExecutionContext: TrailblazeToolExecutionContext,
+    ): TrailblazeToolResult {
+      toolExecutionContext.recordedToolOverride =
+        RecordableStubTool(outputValue = "produced-value")
+      return TrailblazeToolResult.Success()
+    }
+  }
+
+  @Test
+  fun `RecordableHostLocalTool emits a TrailblazeToolLog with the override applied`() {
+    val captured = mutableListOf<TrailblazeLog>()
+    val agent = capturingAgent(captured)
+
+    val result = run(agent, RecordableStubTool())
+
+    assertThat(result.result).isInstanceOf(TrailblazeToolResult.Success::class)
+    val toolLogs = captured.filterIsInstance<TrailblazeLog.TrailblazeToolLog>()
+    assertThat(toolLogs).hasSize(1)
+    assertThat(toolLogs[0].toolName).isEqualTo("recordable_stub")
+    assertThat(toolLogs[0].trailblazeTool.toString().contains("produced-value")).isEqualTo(true)
+  }
+
+  @Test
+  fun `plain HostLocalExecutableTrailblazeTool stays log-suppressed`() {
+    val captured = mutableListOf<TrailblazeLog>()
+    val agent = capturingAgent(captured)
+
+    val result = run(agent, StubHostLocalTool())
+
+    assertThat(result.result).isInstanceOf(TrailblazeToolResult.Success::class)
+    val toolLogs = captured.filterIsInstance<TrailblazeLog.TrailblazeToolLog>()
+    assertThat(toolLogs).hasSize(0)
   }
 }
