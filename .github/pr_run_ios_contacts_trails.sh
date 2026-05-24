@@ -23,6 +23,13 @@ echo "Installing TypeScript SDK devDependencies (esbuild)..."
 (cd sdks/typescript && bun install --frozen-lockfile) \
   || { echo "ERROR: bun install failed in sdks/typescript"; TEST_FAILED=true; }
 
+# Export config dir before the first Gradle invocation so the Gradle daemon
+# starts with it in its environment.  JavaExec subprocesses inherit the daemon's
+# environment, not the caller's shell, so the export must precede the daemon's
+# first start (triggered by :trailblaze-desktop:jar below).
+export TRAILBLAZE_CONFIG_DIR="$(pwd)/examples/ios-contacts/trails/config"
+echo "TRAILBLAZE_CONFIG_DIR=$TRAILBLAZE_CONFIG_DIR"
+
 # Pre-compile the Trailblaze desktop module so the daemon starts within the
 # 110s port-ready window below.
 if [ "$TEST_FAILED" != "true" ]; then
@@ -74,6 +81,10 @@ if [ "$TEST_FAILED" != "true" ]; then
   # simulator at first connection — allow extra time in the workflow timeout.
   ./trailblaze trail -d ios \
     trails/ios-contacts/test-search-by-first-name/ios-iphone.trail.yaml \
+    || TEST_FAILED=true
+
+  ./trailblaze trail -d ios \
+    trails/ios-contacts/test-search-no-results/ios-iphone.trail.yaml \
     || TEST_FAILED=true
 else
   echo "Skipping test execution because setup failed"

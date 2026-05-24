@@ -22,6 +22,13 @@ echo "Installing TypeScript SDK devDependencies (esbuild)..."
 (cd sdks/typescript && bun install --frozen-lockfile) \
   || { echo "ERROR: bun install failed in sdks/typescript"; TEST_FAILED=true; }
 
+# Export config dir before the first Gradle invocation so the Gradle daemon
+# starts with it in its environment.  JavaExec subprocesses inherit the daemon's
+# environment, not the caller's shell, so the export must precede the daemon's
+# first start (triggered by :trailblaze-desktop:jar below).
+export TRAILBLAZE_CONFIG_DIR="$(pwd)/examples/wikipedia/trails/config"
+echo "TRAILBLAZE_CONFIG_DIR=$TRAILBLAZE_CONFIG_DIR"
+
 # Pre-compile the Trailblaze desktop module so the daemon starts within the
 # 110s port-ready window below. Without this, `./trailblaze app …` does a cold
 # Kotlin compile (4+ min on CI) inside the backgrounded process, the wait loop
@@ -31,6 +38,17 @@ echo "Installing TypeScript SDK devDependencies (esbuild)..."
 if [ "$TEST_FAILED" != "true" ]; then
   echo "Pre-building Trailblaze desktop classes..."
   ./gradlew :trailblaze-desktop:jar || { echo "ERROR: Failed to build Trailblaze desktop"; TEST_FAILED=true; }
+fi
+
+# Pre-install Playwright Chromium so the browser is cached before the trail
+# runs.  The JVM Playwright library (version 1.50.0) and the npm package use the
+# same ~/.cache/ms-playwright browser cache, so pre-installing via bunx avoids
+# the download happening inside DaemonClient's hardcoded 1800s poll window.
+if [ "$TEST_FAILED" != "true" ]; then
+  echo "Pre-installing Playwright Chromium..."
+  bunx playwright@1.59.0 install chromium \
+    && echo "✓ Playwright Chromium pre-installed" \
+    || echo "WARNING: Playwright pre-install failed — download will happen during trail execution"
 fi
 
 if [ "$TEST_FAILED" != "true" ]; then

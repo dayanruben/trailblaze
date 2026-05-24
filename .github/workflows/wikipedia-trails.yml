@@ -22,7 +22,7 @@ jobs:
   # pre-recorded tool sequences.
   wikipedia-trails:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       # Recordings-only — LLM is never invoked. A non-empty sentinel value is
       # required to satisfy the provider/client wiring (see android-tests-host-rpc
@@ -52,7 +52,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libasound2 \
+            libasound2t64 \
             libatk-bridge2.0-0 \
             libatk1.0-0 \
             libcups2 \
