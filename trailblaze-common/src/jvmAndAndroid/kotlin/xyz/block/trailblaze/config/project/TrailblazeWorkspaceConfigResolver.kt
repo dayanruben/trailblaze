@@ -21,25 +21,40 @@ object TrailblazeWorkspaceConfigResolver {
     fromPath: Path,
     envReader: () -> String? = { System.getenv(CONFIG_DIR_ENV_VAR) },
   ): ResolvedTrailblazeWorkspaceConfig {
-    val workspaceRoot = findWorkspaceRoot(fromPath)
-    val configFile = (workspaceRoot as? WorkspaceRoot.Configured)?.configFile?.toFile()
     val envOverride = envReader()?.takeIf { it.isNotBlank() }
     if (envOverride != null) {
       val envDir = File(envOverride)
       if (envDir.isDirectory) {
-        // When the configDir has its own trailblaze.yaml, prefer it as the config file so
-        // pack targets declared there (e.g. ios-contacts/packs/contacts) are loaded instead
-        // of the workspace-root config's targets (which may point to a different pack of the
-        // same id with different tools). Falls back to the walk-up configFile when absent.
-        val envConfigFile = File(envDir, TrailblazeConfigPaths.CONFIG_FILENAME).takeIf { it.isFile }
+        // An explicit TRAILBLAZE_CONFIG_DIR is authoritative for the ENTIRE workspace, not
+        // just the file-scan directory. When the override dir carries its own
+        // `trailblaze.yaml`, that anchor — and the targets / trailmaps it declares — wins
+        // over whatever cwd walk-up would have found. Without this, the env var would move
+        // only the payload dir while the anchor still came from the cwd, so a cwd that is
+        // itself a workspace (a monorepo / repo root) silently shadows the env-pointed
+        // workspace's trailmaps — the trail-run tool-registration bug this guards against.
+        // See TrailblazeWorkspaceConfigResolverTest.
+        val envWorkspaceRoot = workspaceRootFromConfigDir(envDir)
+        if (envWorkspaceRoot != null) {
+          return ResolvedTrailblazeWorkspaceConfig(
+            workspaceRoot = envWorkspaceRoot,
+            configFile = envWorkspaceRoot.configFile.toFile(),
+            configDir = envDir,
+          )
+        }
+        // Override dir has no `trailblaze.yaml` of its own: keep the legacy split — anchor
+        // from cwd walk-up, payload dir from the override — so a bare config-dir override
+        // still resolves something usable.
+        val walkUpRoot = findWorkspaceRoot(fromPath)
         return ResolvedTrailblazeWorkspaceConfig(
-          workspaceRoot = workspaceRoot,
-          configFile = envConfigFile ?: configFile,
+          workspaceRoot = walkUpRoot,
+          configFile = (walkUpRoot as? WorkspaceRoot.Configured)?.configFile?.toFile(),
           configDir = envDir,
         )
       }
       Console.log("$CONFIG_DIR_ENV_VAR='$envOverride' is not a directory — ignoring.")
     }
+    val workspaceRoot = findWorkspaceRoot(fromPath)
+    val configFile = (workspaceRoot as? WorkspaceRoot.Configured)?.configFile?.toFile()
     val workspaceConfigDir = when (workspaceRoot) {
       is WorkspaceRoot.Configured ->
         File(workspaceRoot.dir.toFile(), TrailblazeConfigPaths.WORKSPACE_CONFIG_SUBDIR)
@@ -54,12 +69,15 @@ object TrailblazeWorkspaceConfigResolver {
   }
 
   /**
-   * Resolves only the workspace anchor file (`trails/config/trailblaze.yaml`), ignoring
-   * [CONFIG_DIR_ENV_VAR]. The env var overrides the workspace config directory
-   * (`trails/config/`), but it does not define a different workspace root.
+   * Resolves the workspace anchor file (`trails/config/trailblaze.yaml`).
+   *
+   * Honors [CONFIG_DIR_ENV_VAR] consistently with [resolve]: when the env var names a
+   * directory that carries its own `trailblaze.yaml`, that anchor wins; otherwise this falls
+   * back to walking up from [fromPath]. Keeping this in lockstep with [resolve] avoids a
+   * split where the anchor-only callers (LLM config, MCP, CLI info) read a different
+   * workspace than the trail runner.
    */
-  fun resolveConfigFile(fromPath: Path): File? =
-    (findWorkspaceRoot(fromPath) as? WorkspaceRoot.Configured)?.configFile?.toFile()
+  fun resolveConfigFile(fromPath: Path): File? = resolve(fromPath).configFile
 }
 
 data class ResolvedTrailblazeWorkspaceConfig(
@@ -75,7 +93,22 @@ data class ResolvedTrailblazeWorkspaceConfig(
    * [TrailblazeResolvedConfig.targets]. Use this when you need the actual target configs
    * (target discovery, CLI surfaces, the compiler) — [loadProjectConfig] only returns
    * the schema-shape view (id list).
+   *
+   * Pass a non-null [scriptedToolEnrichment] to allow meta-only scripted-tool descriptors
+   * (YAML files with `script:` + `_meta:` only) to resolve via analyzer extraction of the
+   * sibling `.ts`. JVM host callers wire the analyzer-backed implementation here; on-device
+   * runtime / build-time callers leave it null and rely on full-YAML descriptors.
    */
-  fun loadResolvedRuntime(): TrailblazeResolvedConfig? =
-    configFile?.let { TrailblazeProjectConfigLoader.loadResolvedRuntime(it) }
+  fun loadResolvedRuntime(
+    scriptedToolEnrichment: ScriptedToolEnrichment? = null,
+  ): TrailblazeResolvedConfig? =
+    configFile?.let {
+      TrailblazeProjectConfigLoader.load(it)?.let { loaded ->
+        TrailblazeProjectConfigLoader.resolveRuntime(
+          loaded = loaded,
+          includeClasspathTrailmaps = true,
+          scriptedToolEnrichment = scriptedToolEnrichment,
+        )
+      }
+    }
 }
