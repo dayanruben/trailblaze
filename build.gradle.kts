@@ -51,6 +51,10 @@ subprojects {
   }
 }
 
+// Apply shared dependency-resolution forces (version pins) so every configuration resolves the
+// same versions and dependency-guard baselines stay consistent.
+apply(from = "gradle/dependency-resolution.gradle.kts")
+
 // Apply shared git version computation
 apply(from = "gradle/git-version.gradle.kts")
 
