@@ -11,6 +11,7 @@ import kotlinx.serialization.json.jsonObject
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
+import xyz.block.trailblaze.util.Console
 
 /**
  * Default subprocess timeout for [ScriptedToolDefinitionAnalyzer]. Overridable via
@@ -405,10 +406,23 @@ open class ScriptedToolDefinitionAnalyzer(
     private const val MAX_STREAM_IN_MESSAGE = 2_000
 
     /**
-     * Resolve the `bun` binary used to invoke the shim. Mirrors
-     * [LazyYamlScriptedToolRegistration.resolveEsbuildBinary]'s shape — PATH lookup,
-     * no walk-up fallback (unlike esbuild, bun isn't shipped under the SDK's
-     * `node_modules/.bin/`).
+     * Resolve the `bun` binary used to invoke the shim. Two resolution halves:
+     *
+     *  1. **`PATH` lookup** — covers a shell that's run `source bin/activate-hermit`
+     *     (which puts the hermit-pinned `bin/bun` on PATH), a Homebrew install, or any
+     *     globally-installed bun.
+     *  2. **Repo `bin/` walk-up** — when bun isn't on PATH, walk up from CWD looking for
+     *     the repo's hermit-pinned `bin/bun` symlink. This is the load-bearing fix for the
+     *     **fresh-daemon** case: the `./trailblaze` wrapper spawns the daemon JVM with
+     *     whatever PATH the calling shell had, and on a machine that already has JDK 21 the
+     *     wrapper never sourced hermit, so `bun` was absent from the daemon's PATH and every
+     *     meta-only / TS scripted-tool descriptor silently failed to enrich. The hermit
+     *     `bin/bun` symlink is committed to the repo, so the walk-up resolves it regardless
+     *     of how the daemon was launched — no `source bin/activate-hermit` required.
+     *
+     * Mirrors [LazyYamlScriptedToolRegistration.resolveEsbuildBinary]'s PATH-then-walk-up
+     * shape; the difference is the walk-up target (`bin/bun`, the committed hermit symlink,
+     * vs esbuild's SDK `node_modules/.bin/esbuild`).
      *
      * **Bun is the only JS runtime Trailblaze uses.** `setup.sh` installs bun
      * on every Runway CI agent, the SDK's own `bun install` populates the
@@ -421,19 +435,35 @@ open class ScriptedToolDefinitionAnalyzer(
      *
      * `bun.exe` is tried alongside `bun` for Windows-checkout walk-ups.
      *
-     * Returns null when bun is not on PATH. Downstream callers degrade
-     * gracefully — the analyzer reports "no tools extracted" and meta-only
-     * descriptors surface a "no bun on PATH" diagnostic instead of a silent
-     * failure.
+     * Returns null when bun is neither on PATH nor resolvable via the repo `bin/`
+     * walk-up. Downstream callers degrade gracefully — the analyzer reports "no tools
+     * extracted" and meta-only descriptors surface a "no bun" diagnostic instead of a
+     * silent failure.
      */
-    fun resolveBunBinary(): File? = resolveBunBinary(System.getenv("PATH"))
+    fun resolveBunBinary(): File? =
+      resolveBunBinary(
+        pathEnv = System.getenv("PATH"),
+        startDir = File(System.getProperty("user.dir") ?: ".").absoluteFile,
+      )
+
+    /**
+     * Composable form of the no-arg [resolveBunBinary]: PATH first (the bun-only contract),
+     * then the repo `bin/bun` walk-up from [startDir]. Pulled out (and `internal`) so a unit
+     * test can pin the actual production composition — a bun on PATH short-circuits the
+     * walk-up; an absent PATH bun falls through to it (the JDK-21 fresh-daemon case) — without
+     * mutating process env or depending on the host's CWD. The no-arg form just feeds this the
+     * live `PATH` + CWD.
+     */
+    internal fun resolveBunBinary(pathEnv: String?, startDir: File): File? =
+      resolveBunBinary(pathEnv) ?: resolveBunViaWalkup(startDir)
 
     /**
      * Overload for tests — accepts an explicit `PATH` string instead of
      * reading from the JVM env. Production callers use the no-arg form;
      * direct callers in this module mock PATH to pin the "bun-only" contract
      * (any other runtime on PATH must NOT be picked up) without mutating
-     * process env.
+     * process env. This half is PATH-only by design — the [resolveBunViaWalkup]
+     * fallback is composed in by the no-arg [resolveBunBinary].
      */
     internal fun resolveBunBinary(pathEnv: String?): File? {
       val path = pathEnv ?: return null
@@ -443,6 +473,46 @@ open class ScriptedToolDefinitionAnalyzer(
           val candidate = File(dir, name)
           if (candidate.exists() && candidate.canExecute()) return candidate
         }
+      }
+      return null
+    }
+
+    /**
+     * Walk-up half of [resolveBunBinary]: walk from [startDir] upward looking for the
+     * repo's committed hermit `bin/bun` (or `bin/bun.exe`) symlink. The hermit symlink
+     * `bin/bun -> .bun-<version>.pkg` is checked into the repo (see root CLAUDE.md
+     * "Toolchain"), so a daemon launched from anywhere under the repo tree resolves it
+     * even when the spawning shell never ran `source bin/activate-hermit` — closing the
+     * fresh-daemon gap where a JDK-21 host skipped hermit activation and shipped a daemon
+     * with no `bun` on PATH, leaving TS scripted-tool descriptors unregistered.
+     *
+     * **Repo-gated.** The walk-up only accepts a `bin/bun` that sits next to the repo's
+     * committed Hermit activation script (`bin/activate-hermit`). Without that gate the
+     * walk-up would hand back the first executable named `bin/bun` in *any* ancestor of CWD
+     * — so an installed CLI or an untrusted workspace that happens to carry a `bin/bun`
+     * helper could get it executed as the analyzer runtime instead of cleanly degrading to
+     * the previous missing-bun path. `bin/activate-hermit` is committed alongside the pinned
+     * `bin/bun -> .bun-<version>.pkg` symlink (root CLAUDE.md "Toolchain"), so its presence in
+     * the same `bin/` is a reliable marker that this is *this repo's* Hermit toolchain and not
+     * a coincidental `bin/bun`.
+     *
+     * Pulled out (and `internal`) so a unit test can pin the walk-up against an injected
+     * starting directory without depending on the host's actual CWD or repo layout. Requires
+     * the symlink target be executable, matching the PATH half's `canExecute()` guard.
+     */
+    internal fun resolveBunViaWalkup(startDir: File): File? {
+      var current: File? = startDir
+      while (current != null) {
+        val binDir = File(current, "bin")
+        // Only trust this `bin/` if it's the repo's Hermit toolchain dir (proven by the
+        // committed activation script), so we never execute an arbitrary ancestor's `bin/bun`.
+        if (File(binDir, "activate-hermit").isFile) {
+          for (name in listOf("bun", "bun.exe")) {
+            val candidate = File(binDir, name)
+            if (candidate.exists() && candidate.canExecute()) return candidate
+          }
+        }
+        current = current.parentFile
       }
       return null
     }
@@ -485,8 +555,122 @@ open class ScriptedToolDefinitionAnalyzer(
         }
         current = current.parentFile
       }
-      return null
+      // No SDK source tree on disk — the common case for an installed CLI. Fall back to the
+      // self-contained analyzer shim bundled into the framework JAR, extracted to a stable
+      // cache dir. Returns null only when the JAR didn't ship the bundle (a dev build that
+      // skipped `bundleScriptedToolAnalyzerShim`), preserving the prior "analyzer
+      // unavailable" degradation.
+      return resolveBundledAnalyzerSdkDir()
     }
+
+    /**
+     * JAR-resource path of the self-contained analyzer shim — `extract-tool-defs.mjs` with
+     * `ts-json-schema-generator` + `typescript` bundled in by `:trailblaze-models`'s
+     * `bundleScriptedToolAnalyzerShim` task. Absent in dev builds that skipped that task.
+     */
+    internal const val BUNDLED_ANALYZER_SHIM_RESOURCE: String =
+      "trails/config/analyzer/extract-tool-defs.mjs"
+
+    /** Per-process memo of the extracted bundled-shim dir. The bundle is fixed for a given
+     *  CLI build, so the ~7 MB resource is read + validated at most once per JVM (a CLI
+     *  upgrade is a new process, which re-validates). `@Volatile` + idempotent extraction
+     *  make a benign double-extract under a thread race harmless. */
+    @Volatile
+    private var bundledAnalyzerSdkDirMemo: File? = null
+
+    /**
+     * Final fallback for [resolveSdkDir]: extract the framework-bundled, self-contained
+     * analyzer shim from the JAR to the per-user cache dir and return it. The bundle inlines
+     * all of its npm deps, so the extracted shim runs under `bun` with no `node_modules` —
+     * which is what lets an installed CLI (no SDK source tree) analyze typed tools out of the
+     * box. Memoized per process.
+     *
+     * Returns null when the JAR doesn't carry the bundle (dev build), so callers degrade to
+     * the "analyzer unavailable" message rather than crashing.
+     */
+    internal fun resolveBundledAnalyzerSdkDir(): File? {
+      bundledAnalyzerSdkDirMemo?.let { return it }
+      val dir = extractBundledAnalyzerShim(
+        File(System.getProperty("user.home") ?: ".", ".trailblaze/analyzer"),
+      )
+      if (dir != null) bundledAnalyzerSdkDirMemo = dir
+      return dir
+    }
+
+    /**
+     * Extract the bundled shim resource to [cacheRoot] and return the dir, or null. Best-effort:
+     * a missing resource (dev build), an *empty* resource (a stripped/corrupt build — guarded so
+     * we don't leave a zero-byte shim that the marker would make [analyzerToolingAvailable]
+     * accept), or any I/O error all yield null + a diagnostic, never a thrown exception — the
+     * caller then degrades to "analyzer unavailable". Split out (no memo) so it's unit-testable
+     * with an explicit dir.
+     */
+    internal fun extractBundledAnalyzerShim(cacheRoot: File): File? = try {
+      val bytes = ScriptedToolDefinitionAnalyzer::class.java.classLoader
+        ?.getResourceAsStream(BUNDLED_ANALYZER_SHIM_RESOURCE)
+        ?.use { it.readBytes() }
+      when {
+        bytes == null -> null
+        bytes.isEmpty() -> {
+          Console.info(
+            "[ScriptedToolDefinitionAnalyzer] bundled analyzer shim resource is empty — " +
+              "skipping (typed-tool analysis unavailable from the bundled shim).",
+          )
+          null
+        }
+        else -> extractBundledShim(bytes, cacheRoot).also {
+          Console.info("[ScriptedToolDefinitionAnalyzer] using JAR-bundled analyzer shim at $it")
+        }
+      }
+    } catch (e: Exception) {
+      Console.info(
+        "[ScriptedToolDefinitionAnalyzer] failed to extract bundled analyzer shim " +
+          "(${e.message ?: e.javaClass.simpleName}) — typed-tool analysis unavailable.",
+      )
+      null
+    }
+
+    /**
+     * Write [shimBytes] to `<cacheRoot>/tools/extract-tool-defs.mjs` (the layout
+     * [resolveExtractorShim] expects) and return [cacheRoot]. Skip-write-if-content-matches
+     * keeps the cached shim's mtime stable across runs of the same framework build. Split
+     * out so it's unit-testable without a JAR on the classpath.
+     */
+    internal fun extractBundledShim(shimBytes: ByteArray, cacheRoot: File): File {
+      val shimFile = File(cacheRoot, "tools/extract-tool-defs.mjs")
+      val stale = !shimFile.isFile ||
+        shimFile.length() != shimBytes.size.toLong() ||
+        !shimFile.readBytes().contentEquals(shimBytes)
+      if (stale) {
+        shimFile.parentFile.mkdirs()
+        shimFile.writeBytes(shimBytes)
+      }
+      // Marker so [analyzerToolingAvailable] recognizes this dir as the self-contained
+      // bundle — it has no `node_modules/` (the deps are inlined into the shim), which the
+      // source-tree preflight would otherwise reject.
+      val marker = File(cacheRoot, BUNDLED_ANALYZER_MARKER_FILENAME)
+      if (!marker.isFile) {
+        marker.parentFile.mkdirs()
+        marker.writeText("Trailblaze self-contained scripted-tool analyzer shim bundle.\n")
+      }
+      return cacheRoot
+    }
+
+    /** Marker file written into the bundled-shim cache dir by [extractBundledShim]; its
+     *  presence means the shim is self-contained (deps inlined), so no `node_modules/`
+     *  tree is required to run it. */
+    internal const val BUNDLED_ANALYZER_MARKER_FILENAME: String = ".trailblaze-bundled-analyzer"
+
+    /**
+     * True when [sdkDir] can actually drive the extractor shim: either it's a real SDK
+     * source tree with `node_modules/ts-json-schema-generator` installed, OR it's the
+     * framework-bundled self-contained shim dir (deps inlined — see [extractBundledShim]).
+     * Callsites gate on this before constructing an analyzer so a shim with no resolvable
+     * deps isn't invoked and then fail per-trailmap with `ERR_MODULE_NOT_FOUND`.
+     */
+    fun analyzerToolingAvailable(sdkDir: File): Boolean =
+      File(sdkDir, "node_modules/ts-json-schema-generator").isDirectory ||
+        File(sdkDir, BUNDLED_ANALYZER_MARKER_FILENAME).isFile
 
     /**
      * Convenience: resolve the shim file under the SDK tree (or under

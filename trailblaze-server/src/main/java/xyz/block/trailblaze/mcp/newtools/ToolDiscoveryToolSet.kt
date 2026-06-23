@@ -27,6 +27,7 @@ import xyz.block.trailblaze.scripting.mcp.TrailblazeToolMeta
 import xyz.block.trailblaze.scripting.mcp.shouldRegisterForPlatform
 import xyz.block.trailblaze.toolcalls.KoogToolExt
 import xyz.block.trailblaze.toolcalls.TrailblazeTool
+import xyz.block.trailblaze.toolcalls.getExcludedToolSurfaceForDriver
 import xyz.block.trailblaze.toolcalls.commands.ObjectiveStatusTrailblazeTool
 import xyz.block.trailblaze.toolcalls.TrailblazeToolDescriptor
 import xyz.block.trailblaze.toolcalls.TrailblazeToolParameterDescriptor
@@ -715,13 +716,21 @@ class ToolDiscoveryToolSet(
     if (driverType == null || target == null) return systemExclusions
 
     val targetExclusions = try {
-      val classExclusions = target.getExcludedToolsForDriver(driverType)
+      // One read of the target's `excluded_tools:` surface across all three backings — the same
+      // central accessor the resolver / runtime / on-device paths use. This keeps discovery's
+      // hidden set in lockstep with what the agent actually sees: a target's
+      // `excluded_tools: [pressBack]` (YAML) or `[openUrl]` (scripted) is hidden here exactly as
+      // it's dropped from the LLM surface.
+      val excluded = target.getExcludedToolSurfaceForDriver(driverType)
+      // Class exclusions resolve to their advertised descriptor name (the @TrailblazeToolClass
+      // name); YAML + scripted exclusions are already names.
+      val classExclusions = excluded.toolClasses
         .mapNotNull { it.toTrailblazeToolDescriptorWithSource()?.name }
-      // YAML-defined exclusions ride alongside class-backed ones so a target's
-      // `excluded_tools: [pressBack]` is respected by the discovery layer.
-      val yamlExclusions = target.getExcludedYamlToolNamesForDriver(driverType)
-        .map { it.toolName }
-      (classExclusions + yamlExclusions).toSet()
+      (
+        classExclusions +
+          excluded.yamlToolNames.map { it.toolName } +
+          excluded.scriptedToolNames.map { it.toolName }
+        ).toSet()
     } catch (e: Exception) {
       // Don't fail discovery if a target's exclusion lookup throws — just degrade to "no
       // target-side exclusions" and surface the failure so it isn't silent during debugging.
@@ -753,9 +762,12 @@ class ToolDiscoveryToolSet(
    * Get custom tool descriptors for a specific driver type.
    * Used when a device is connected and we know the exact driver.
    *
-   * Unions class-backed, YAML-defined, and inline-scripted tools so name/search/target listings
-   * see the same set the executor accepts. Without the YAML branch, name-only entries pulled in
-   * by a target's `tool_sets:` would silently drop from these listings even when they execute fine.
+   * Unions class-backed, YAML-defined, catalog-scripted (toolset / `platforms.<p>.tools:` names),
+   * and inline-scripted (`target.tools:`) tools so name/search/target listings see the same set the
+   * executor accepts. Without the YAML/scripted branches, name-only entries pulled in by a target's
+   * `tool_sets:` or `tools:` would silently drop from these listings even when they execute fine —
+   * the same three-way parity the grouped [TrailblazeHostAppTarget.ToolGroup.toMergedDescriptors]
+   * path enforces.
    */
   private fun getCustomToolDescriptors(
     target: TrailblazeHostAppTarget,
@@ -766,7 +778,9 @@ class ToolDiscoveryToolSet(
         .mapNotNull { it.toTrailblazeToolDescriptorWithSource() }
       val yamlDescriptors = KoogToolExt
         .buildTrailblazeDescriptorsForYamlDefined(target.getCustomYamlToolNamesForDriver(driverType))
-      (classDescriptors + yamlDescriptors + getInlineToolDescriptors(target, driverType))
+      val scriptedDescriptors = InProcessScriptedToolLauncher
+        .describe(target.getCustomScriptedToolNamesForDriver(driverType))
+      (classDescriptors + yamlDescriptors + scriptedDescriptors + getInlineToolDescriptors(target, driverType))
         .distinctBy { it.name }
         .sortedWith(compareBy { it.name })
     } catch (_: Exception) {
@@ -778,9 +792,11 @@ class ToolDiscoveryToolSet(
    * Get custom tool descriptors for all driver types on a platform.
    * Used as fallback when no device is connected.
    *
-   * Same class+YAML+inline union as [getCustomToolDescriptors], collapsed across every driver
-   * for [platform] so a target's full surface area shows up regardless of which driver the
-   * caller eventually picks.
+   * Same class+YAML+scripted+inline union as [getCustomToolDescriptors], collapsed across every
+   * driver for [platform] so a target's full surface area shows up regardless of which driver the
+   * caller eventually picks. Scripted names are unioned across drivers first, then described in a
+   * single [InProcessScriptedToolLauncher.describe] call (one catalog walk per invocation, matching
+   * the YAML branch) rather than per-driver.
    */
   private fun getCustomToolDescriptorsForPlatform(
     target: TrailblazeHostAppTarget,
@@ -796,7 +812,11 @@ class ToolDiscoveryToolSet(
         .flatMap { driverType -> target.getCustomYamlToolNamesForDriver(driverType) }
         .toSet()
       val yamlDescriptors = KoogToolExt.buildTrailblazeDescriptorsForYamlDefined(yamlNames)
-      (classDescriptors + yamlDescriptors + getInlineToolDescriptorsForPlatform(target, platform))
+      val scriptedNames = driverTypes
+        .flatMap { driverType -> target.getCustomScriptedToolNamesForDriver(driverType) }
+        .toSet()
+      val scriptedDescriptors = InProcessScriptedToolLauncher.describe(scriptedNames)
+      (classDescriptors + yamlDescriptors + scriptedDescriptors + getInlineToolDescriptorsForPlatform(target, platform))
         .distinctBy { it.name }
         .sortedWith(compareBy { it.name })
     } catch (_: Exception) {
@@ -1083,14 +1103,22 @@ data class ToolDiscoverySearchMatch(
  * through alongside class-backed tools.
  *
  * Class descriptors take precedence on name collision (class-backed implementations are
- * authoritative; YAML names are descriptors only). `distinctBy { name }` defends against a future
- * hand-built `ToolGroup` that lists the same name in both `toolClasses` and `yamlToolNames` —
- * today's [YamlBackedHostAppTarget] resolver enforces mutual exclusion via a typed `when`, but
- * the data model itself does not.
+ * authoritative; YAML and scripted names are descriptors only), then YAML, then scripted.
+ * `distinctBy { name }` defends against a future hand-built `ToolGroup` that lists the same name in
+ * more than one backing — today's [YamlBackedHostAppTarget] resolver enforces mutual exclusion via
+ * a typed `when`, but the data model itself does not.
+ *
+ * Scripted (`.ts` / `.js`) descriptors come from [InProcessScriptedToolLauncher.describe], which
+ * resolves each name via `ScriptedToolNameDiscoverer` (trailmap `tools/` descriptor YAMLs on the
+ * classpath + workspace overlay) — the same resolution the resolved-surface and non-grouped
+ * discovery paths use. So a target whose custom tools are scripted shows up in grouped discovery
+ * output alongside class- and YAML-backed tools — the discovery-grouping leg of the three-way
+ * tool-backing parity.
  */
 internal fun TrailblazeHostAppTarget.ToolGroup.toMergedDescriptors(): List<TrailblazeToolDescriptor> {
   val classDescriptors = toolClasses
     .mapNotNull { it.toTrailblazeToolDescriptorWithSource() }
   val yamlDescriptors = KoogToolExt.buildTrailblazeDescriptorsForYamlDefined(yamlToolNames)
-  return (classDescriptors + yamlDescriptors).distinctBy { it.name }
+  val scriptedDescriptors = InProcessScriptedToolLauncher.describe(scriptedToolNames)
+  return (classDescriptors + yamlDescriptors + scriptedDescriptors).distinctBy { it.name }
 }

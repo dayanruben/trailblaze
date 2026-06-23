@@ -1,23 +1,13 @@
 package xyz.block.trailblaze.host.rules
 
-import ai.koog.agents.core.tools.ToolDescriptor
-import ai.koog.prompt.Prompt
-import ai.koog.prompt.message.AttachmentContent
-import ai.koog.prompt.message.AttachmentSource
-import ai.koog.prompt.message.Message
-import ai.koog.prompt.message.MessagePart
-import ai.koog.prompt.message.RequestMetaInfo
-import ai.koog.utils.time.KoogClock
-import ai.koog.prompt.params.LLMParams
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
 import org.junit.Rule
 import org.junit.rules.RuleChain
 import xyz.block.trailblaze.AgentMemory
 import xyz.block.trailblaze.TrailblazeYamlUtil
-import xyz.block.trailblaze.agent.BlazeConfig
 import xyz.block.trailblaze.agent.DefaultProgressReporter
 import xyz.block.trailblaze.agent.InnerLoopScreenAnalyzer
 import xyz.block.trailblaze.agent.MultiAgentV3Runner
@@ -27,9 +17,6 @@ import xyz.block.trailblaze.BaseTrailblazeAgent
 import xyz.block.trailblaze.agent.TrailblazeRunner
 import xyz.block.trailblaze.mcp.agent.KoogTestAgentRunner
 import xyz.block.trailblaze.yaml.PromptStep
-import xyz.block.trailblaze.agent.blaze.PlannerLlmCall
-import xyz.block.trailblaze.agent.blaze.PlannerToolCallResult
-import xyz.block.trailblaze.api.ImageFormatDetector
 import xyz.block.trailblaze.api.TestAgentRunner
 import xyz.block.trailblaze.devices.TrailblazeDeviceClassifier
 import xyz.block.trailblaze.devices.TrailblazeDeviceId
@@ -62,12 +49,17 @@ import xyz.block.trailblaze.recordings.TrailRecordings
 import xyz.block.trailblaze.rules.RetryRule
 import xyz.block.trailblaze.rules.TrailblazeLoggingRule
 import xyz.block.trailblaze.rules.TrailblazeRunnerUtil
+import xyz.block.trailblaze.scripting.HostScriptedToolLauncher
+import xyz.block.trailblaze.scripting.LaunchedScriptingRuntime
+import xyz.block.trailblaze.toolcalls.EmptyTrailblazeToolSurface
 import xyz.block.trailblaze.toolcalls.ToolName
 import xyz.block.trailblaze.toolcalls.TrailblazeKoogTool.Companion.toTrailblazeToolDescriptor
 import xyz.block.trailblaze.toolcalls.TrailblazeTool
 import xyz.block.trailblaze.toolcalls.TrailblazeToolRepo
 import xyz.block.trailblaze.toolcalls.TrailblazeToolResult
 import xyz.block.trailblaze.toolcalls.TrailblazeToolSet
+import xyz.block.trailblaze.toolcalls.TrailblazeToolSurface
+import xyz.block.trailblaze.toolcalls.getExcludedToolSurfaceForDriver
 import xyz.block.trailblaze.util.Console
 import xyz.block.trailblaze.util.TemplatingUtil
 import xyz.block.trailblaze.yaml.TrailYamlItem
@@ -88,7 +80,7 @@ abstract class BaseHostTrailblazeTest(
   customYamlToolNames: Set<ToolName> = setOf(),
   excludedToolClasses: Set<KClass<out TrailblazeTool>> = setOf(),
   maxRetries: Int = 0,
-  appTarget: TrailblazeHostAppTarget? = null,
+  private val appTarget: TrailblazeHostAppTarget? = null,
   explicitDeviceId: TrailblazeDeviceId? = null,
 ) {
 
@@ -234,20 +226,40 @@ abstract class BaseHostTrailblazeTest(
     System.getProperty("trailblaze.agent", AgentImplementation.DEFAULT_NAME)
       .let { AgentImplementation.valueOf(it) }
 
+  /**
+   * The active target's `excluded_tools:` surface (class / YAML / scripted) for this driver, when an
+   * [appTarget] was supplied. Threaded into the repo below so a host JUnit/CLI run honors the SAME
+   * scripted + YAML opt-outs the daemon and on-device paths do — not just the class-backed ones the
+   * explicit [excludedToolClasses] param historically carried. Empty when no target was given.
+   */
+  private val targetExcludedSurface: TrailblazeToolSurface =
+    appTarget?.getExcludedToolSurfaceForDriver(trailblazeDriverType) ?: EmptyTrailblazeToolSurface
+
   val toolRepo = if (trailblazeToolSet != null) {
     // Explicit tool set override — bypass dynamic catalog
     TrailblazeToolRepo(
       trailblazeToolSet = TrailblazeToolSet.DynamicTrailblazeToolSet(
         name = "Custom Tool Set",
-        toolClasses = trailblazeToolSet.toolClasses + customToolClasses - excludedToolClasses,
-        yamlToolNames = trailblazeToolSet.yamlToolNames + customYamlToolNames,
+        toolClasses = trailblazeToolSet.toolClasses + customToolClasses -
+          (excludedToolClasses + targetExcludedSurface.toolClasses),
+        yamlToolNames = trailblazeToolSet.yamlToolNames + customYamlToolNames -
+          targetExcludedSurface.yamlToolNames,
+        // Forward the explicit toolset's scripted tools too (they were silently dropped before)
+        // and honor the target's scripted opt-outs, so this override branch stays symmetric with
+        // the dynamic-catalog branch below.
+        scriptedToolNames = trailblazeToolSet.scriptedToolNames - targetExcludedSurface.scriptedToolNames,
       ),
     )
   } else {
     TrailblazeToolRepo.withDynamicToolSets(
       customToolClasses = customToolClasses,
       customYamlToolNames = customYamlToolNames,
-      excludedToolClasses = excludedToolClasses,
+      // Union the explicit class opt-outs with the target's full surface, and forward the YAML +
+      // scripted partitions too (via getExcludedToolSurfaceForDriver) so an `excluded_tools:
+      // [openUrl]` target doesn't advertise openUrl in a host run.
+      excludedToolClasses = excludedToolClasses + targetExcludedSurface.toolClasses,
+      excludedYamlToolNames = targetExcludedSurface.yamlToolNames,
+      excludedScriptedToolNames = targetExcludedSurface.scriptedToolNames,
       driverType = trailblazeDriverType,
     )
   }
@@ -305,46 +317,6 @@ abstract class BaseHostTrailblazeTest(
       agentMemory = (trailblazeAgent as? xyz.block.trailblaze.BaseTrailblazeAgent)?.memory ?: AgentMemory(),
     )
 
-    val plannerLlmCall: PlannerLlmCall = { systemPrompt, userMessage, tools, traceId, screenshotBytes ->
-      val metaInfo = RequestMetaInfo.create(KoogClock.System)
-      val userMsg = if (screenshotBytes != null && screenshotBytes.isNotEmpty()) {
-        Message.User(
-          parts = buildList<MessagePart.RequestPart> {
-            add(MessagePart.Text(userMessage))
-            add(
-              MessagePart.Attachment(
-                source = AttachmentSource.Image(
-                  content = AttachmentContent.Binary.Bytes(screenshotBytes),
-                  format = ImageFormatDetector.detectFormat(screenshotBytes).mimeSubtype,
-                ),
-              )
-            )
-          },
-          metaInfo = metaInfo,
-        )
-      } else {
-        Message.User(content = userMessage, metaInfo = metaInfo)
-      }
-      val koogPrompt = Prompt(
-        messages = listOf(
-          Message.System(content = systemPrompt, metaInfo = metaInfo),
-          userMsg,
-        ),
-        id = "host_test_planner",
-        params = LLMParams(toolChoice = LLMParams.ToolChoice.Required),
-      )
-      val response = llmClient.execute(koogPrompt, trailblazeLlmModel.toKoogLlmModel(), tools)
-      val toolCall = response.parts.filterIsInstance<MessagePart.Tool.Call>().firstOrNull()
-      val toolName = toolCall?.tool ?: tools.firstOrNull()?.name ?: "unknown"
-      val toolArgsJson = toolCall?.args ?: "{}"
-      val toolArgs = try {
-        Json.parseToJsonElement(toolArgsJson) as? JsonObject ?: JsonObject(emptyMap())
-      } catch (_: Exception) {
-        JsonObject(emptyMap())
-      }
-      PlannerToolCallResult.fromRaw(toolName, toolArgs)
-    }
-
     val session = loggingRule.session ?: error("Session not available - ensure test is running")
     val progressListener = loggingRule.logger.createProgressListener(session)
     val progressReporter = DefaultProgressReporter(progressListener)
@@ -356,8 +328,6 @@ abstract class BaseHostTrailblazeTest(
     val v3Runner = MultiAgentV3Runner.create(
       screenAnalyzer = screenAnalyzer,
       executor = executor,
-      plannerLlmCall = plannerLlmCall,
-      config = BlazeConfig.DEFAULT,
       progressReporter = progressReporter,
       deviceId = trailblazeDeviceId,
       availableToolsProvider = availableToolsProvider,
@@ -599,6 +569,15 @@ abstract class BaseHostTrailblazeTest(
     if (sendSessionStartLog) {
       val session = loggingRule.session
       if (session != null) {
+        // A session that runs under a real JUnit harness carries a Description we can read the
+        // class/method from. CLI / daemon runs don't (the runner builds an anonymous
+        // `object : BaseHostTrailblazeTest`, whose simpleName is empty), so derive a readable
+        // `Suite::test` identity from the trail path instead of stamping this base class's name
+        // — that "BaseHostTrailblazeTest::run" subtitle in the Sessions list told the reader
+        // nothing and looked like a leftover JUnit artifact.
+        val derivedTestIdentity = trailFilePath?.let {
+          TrailRecordings.deriveTestIdentityFromTrailPath(it, fallbackClassName = "Trailblaze")
+        }
         loggingRule.logger.log(
           session,
           TrailblazeLog.TrailblazeSessionStatusChangeLog(
@@ -607,8 +586,11 @@ abstract class BaseHostTrailblazeTest(
               trailFilePath = trailFilePath,
               testClassName = loggingRule.description?.className
                 ?: this::class.java.simpleName.takeIf { it.isNotEmpty() }
-                ?: "BaseHostTrailblazeTest",
-              testMethodName = loggingRule.description?.methodName ?: "run",
+                ?: derivedTestIdentity?.className
+                ?: "Trailblaze",
+              testMethodName = loggingRule.description?.methodName
+                ?: derivedTestIdentity?.methodName
+                ?: "run",
               trailblazeDeviceInfo = loggingRule.trailblazeDeviceInfoProvider(),
               rawYaml = yaml,
               hasRecordedSteps = trailblazeYaml.hasRecordedSteps(trailItems),
@@ -621,7 +603,32 @@ abstract class BaseHostTrailblazeTest(
       }
     }
     currentToolTraceId = traceId
+    // Register this session's IN-PROCESS scripted tools (target.tools: + catalog) into the repo so
+    // the agent loop, recorded-replay re-execution, AND Kotlin composition via `invokeFrameworkTool`
+    // can resolve them by name. This is the host test rule's analog of the daemon's
+    // `TrailblazeHostYamlRunner` launch and the on-device `AndroidTrailblazeRule` registration —
+    // without it, a recorded composite launch tool that re-runs on replay and dispatches a
+    // TypeScript sub-step by name via `invokeFrameworkTool` would hit "Unknown framework tool".
+    // Subprocess scripted tools are intentionally NOT
+    // launched here (`includeSubprocess = false`) — no host test needs one, and `target.tools:` isn't
+    // platform-scoped, so launching them would fork the web sign-in subprocess on a mobile session.
+    var launchedScripting: LaunchedScriptingRuntime? = null
     try {
+      val session = loggingRule.session
+      if (session != null) {
+        launchedScripting = HostScriptedToolLauncher.launch(
+          targetTestApp = appTarget,
+          config = config,
+          sessionId = session.sessionId,
+          deviceInfo = loggingRule.trailblazeDeviceInfoProvider(),
+          logsRepo = hostLoggingRule.logsRepo,
+          toolRepo = toolRepo,
+          classLoader = javaClass.classLoader,
+          logPrefix = "[BaseHostTrailblazeTest]",
+          includeSubprocess = false,
+          onProgressMessage = { Console.log("[BaseHostTrailblazeTest] $it") },
+        )
+      }
       if (!trailblazeYaml.hasActionableSteps(trailItems)) {
         val trailName = trailConfig?.title ?: trailFilePath ?: "unknown"
         val trailUrl = trailConfig?.metadata?.get("testRailUrl")
@@ -633,6 +640,9 @@ abstract class BaseHostTrailblazeTest(
       }
       runTrail(trailItems, useRecordedSteps)
     } finally {
+      // Free QuickJS engines + deregister the dynamic tools so a reused repo doesn't collide on a
+      // later session. NonCancellable so teardown completes even on trail timeout / abort.
+      launchedScripting?.let { runtime -> withContext(NonCancellable) { runtime.shutdownAll() } }
       currentToolTraceId = null
     }
     return loggingRule.session?.sessionId ?: SessionId("unknown")
