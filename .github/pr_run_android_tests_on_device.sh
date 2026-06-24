@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # On-device path: runs the trail through `connectedDebugAndroidTest` (classic JUnit
 # instrumentation). The test logic executes inside the test process on the emulator
-# and talks to the headless desktop server on the default HTTPS port for agent orchestration.
+# and writes Trailblaze logs/screenshots to the device's Downloads directory.
 # Note: intentionally not using set -e so that log collection always runs even if build/tests fail
 TRAILBLAZE_LOGS_DIR="$(pwd)/trailblaze-logs"
-
-# Must match TrailblazeDevicePort.TRAILBLAZE_DEFAULT_HTTPS_PORT
-# (= TRAILBLAZE_DEFAULT_HTTP_PORT + 1 = 52525 + 1).
-TRAILBLAZE_HTTPS_PORT=52526
-TRAILBLAZE_LOCAL_LOGS_DIR="$HOME/.trailblaze/logs"
 
 # Create logs directory early so it always exists for downstream steps
 mkdir -p "$TRAILBLAZE_LOGS_DIR"
@@ -16,32 +11,6 @@ mkdir -p "$TRAILBLAZE_LOGS_DIR"
 echo "========================================="
 echo "Starting Android Test Execution (on-device)"
 echo "Working directory: $(pwd)"
-echo "========================================="
-
-# Start Trailblaze server in background. The CLI was installed onto $PATH by
-# the workflow's `install-trailblaze-from-artifact.sh` step (from the upstream
-# `build-uber-jar` job's prebuilt JAR), so `trailblaze` here runs via
-# `java -jar` — no Gradle compile, no daemon start. `app --foreground
-# --headless` keeps the JVM in the foreground so backgrounding with `&` lets
-# us poll the HTTPS port until ready. The `app` subcommand is required —
-# bare `--headless` raises "Unknown option: '--headless'".
-echo "Starting Trailblaze server..."
-trailblaze app --foreground --headless > /tmp/trailblaze.log 2>&1 &
-TRAILBLAZE_PID=$!
-echo "Trailblaze server started with PID: $TRAILBLAZE_PID"
-echo "Waiting for Trailblaze server to be ready on port $TRAILBLAZE_HTTPS_PORT (this may take up to 2 minutes)..."
-sleep 10
-for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  nc -z localhost "$TRAILBLAZE_HTTPS_PORT" > /dev/null 2>&1 && break || (echo "Attempt $attempt/20..." && sleep 5)
-done
-if ! nc -z localhost "$TRAILBLAZE_HTTPS_PORT" > /dev/null 2>&1; then
-  echo "ERROR: Trailblaze server failed to start on port $TRAILBLAZE_HTTPS_PORT"
-  echo "=== Trailblaze logs ==="
-  cat /tmp/trailblaze.log
-  TEST_FAILED=true
-else
-  echo "✓ Trailblaze server is running on port $TRAILBLAZE_HTTPS_PORT!"
-fi
 echo "========================================="
 
 # Start capturing logcat
@@ -52,14 +21,11 @@ echo "Logcat capture started with PID: $LOGCAT_PID"
 echo "========================================="
 
 # Run Android Tests
-echo "Assembling Android Tests..."
-./gradlew :examples:assembleDebugAndroidTest || TEST_FAILED=true
-
 if [ "$TEST_FAILED" != "true" ]; then
   echo "Running Android Tests..."
   ./gradlew --info :examples:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class="xyz.block.trailblaze.examples.clock.ClockTest" || TEST_FAILED=true
 else
-  echo "Skipping test execution because an earlier step (server start or assembly) failed"
+  echo "Skipping test execution because setup failed"
 fi
 
 echo "========================================="
@@ -84,34 +50,12 @@ echo "Checking pulled logs..."
 ls -laR "$TRAILBLAZE_LOGS_DIR"
 echo "Total files pulled: $(find "$TRAILBLAZE_LOGS_DIR" -type f 2>/dev/null | wc -l)"
 
-echo "Checking contents of $TRAILBLAZE_LOCAL_LOGS_DIR..."
-if [ -d "$TRAILBLAZE_LOCAL_LOGS_DIR" ]; then
-  ls -laR "$TRAILBLAZE_LOCAL_LOGS_DIR"
-  echo "Total files in local logs: $(find "$TRAILBLAZE_LOCAL_LOGS_DIR" -type f 2>/dev/null | wc -l)"
-else
-  echo "Directory $TRAILBLAZE_LOCAL_LOGS_DIR does not exist"
-fi
-
-echo "Copying logs from $TRAILBLAZE_LOCAL_LOGS_DIR to $TRAILBLAZE_LOGS_DIR..."
-mkdir -p "$TRAILBLAZE_LOGS_DIR"
-cp -r "$TRAILBLAZE_LOCAL_LOGS_DIR"/* "$TRAILBLAZE_LOGS_DIR/" 2>/dev/null || echo "No logs found in $TRAILBLAZE_LOCAL_LOGS_DIR"
-
-# Copy server log for debugging
-if [ -f /tmp/trailblaze.log ]; then
-  cp /tmp/trailblaze.log "$TRAILBLAZE_LOGS_DIR/trailblaze-server.log"
-  echo "Copied server log to $TRAILBLAZE_LOGS_DIR/trailblaze-server.log"
-fi
-
-# Cleanup: Kill background servers
+# Cleanup: Kill background log collection
 echo "========================================="
 echo "Cleaning up background processes..."
 if [ -n "$LOGCAT_PID" ]; then
   echo "Stopping logcat capture (PID: $LOGCAT_PID)..."
   kill $LOGCAT_PID 2>/dev/null || echo "Logcat capture already stopped"
-fi
-if [ -n "$TRAILBLAZE_PID" ]; then
-  echo "Stopping Trailblaze server (PID: $TRAILBLAZE_PID)..."
-  kill $TRAILBLAZE_PID 2>/dev/null || echo "Trailblaze server already stopped"
 fi
 echo "✓ Cleanup complete"
 echo "========================================="
