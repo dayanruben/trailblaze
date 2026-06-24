@@ -1,0 +1,34 @@
+- config:
+    title: 'Contacts (iOS): Create a contact then delete it'
+    target: contacts
+    platform: ios
+    driver: IOS_HOST
+- prompts:
+  - step: Remove any leftover "Trailblaze Demo" contact so we start from a clean slate.
+    recording:
+      tools:
+      - contacts_ios_deleteContact:
+          name: Trailblaze Demo
+  - step: Create a new contact named Trailblaze Demo with the phone number 555-123-4567.
+    recording:
+      tools:
+      - contacts_ios_createContact:
+          firstName: Trailblaze
+          lastName: Demo
+          phoneNumber: "5551234567"
+  - step: Verify the new "Trailblaze Demo" contact was saved.
+    recording:
+      tools:
+      - assertVisibleBySelector:
+          reason: The objective is to verify that the contacts list now shows a 'Trailblaze Demo' row. The UI hierarchy and screenshot both show a visible element with the text 'Trailblaze Demo', confirming the presence of the required contact.
+          selector:
+            index: "67"
+          nodeSelector:
+            iosMaestro:
+              resourceIdRegex: ContactCardHeaderView
+          expectedText: Trailblaze Demo
+  - step: Delete the "Trailblaze Demo" contact.
+    recording:
+      tools:
+      - contacts_ios_deleteContact:
+          name: Trailblaze Demo
