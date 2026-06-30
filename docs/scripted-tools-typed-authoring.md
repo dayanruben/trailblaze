@@ -30,8 +30,8 @@ straight through without context-switching:
 | **trail** | A `.yaml` test file (`blaze.yaml` + optional `<device>.trail.yaml` recording) that exercises a target. |
 | **`trailblaze` CLI** | The single binary you run. On first invocation it boots a local **daemon** that holds the device session and dispatches tools. Restart the daemon when you change a trailmap; everything else (typings, schema extraction, test runs) flows through the CLI. |
 | **driver** | The framework's adapter for one platform — `ios-host` for iOS Simulator, `playwright-native` for browsers, etc. A target picks which drivers it supports under `platforms.<p>.drivers:`. |
-| **host vs on-device** | "Host" is the developer machine running the daemon and CLI. "On-device" is the emulator / simulator / browser the trailmap drives. Tools default to running on-host; the `requiresHost: true` spec flag enforces that for tools that need Node-only APIs. |
-| **QuickJS** | The embedded JavaScript engine the daemon uses to dispatch `.ts` tools in-process (no subprocess fork, no Node `node_modules`). Tools needing full Node-compatible APIs opt into a Bun subprocess via `requiresHost: true`. |
+| **host vs on-device** | "Host" is the developer machine running the daemon and CLI. "On-device" is the emulator / simulator / browser the trailmap drives. The `requiresHost: true` spec flag keeps an in-process tool host-only (skips on-device registration); it does not change the runtime. |
+| **QuickJS** | The embedded JavaScript engine the daemon uses to dispatch `.ts` tools in-process (no subprocess fork, no Node `node_modules`). Tools needing full Node-compatible APIs select the Bun subprocess via `runtime: subprocess` in their descriptor. |
 | **MCP** | Model Context Protocol — the wire protocol the daemon uses to advertise tools to the agent. Scripted tools register through this automatically; you never touch the protocol directly. |
 
 See [Getting Started](getting_started.md) for install + first-device pairing.
@@ -208,6 +208,13 @@ that DO export but aren't listed under `target.tools:` (e.g. typed-demo or
 work-in-progress drafts) live in the candidate pool but stay invisible to the agent
 until you add their name to the list.
 
+When a trailmap ships **both** iOS and Android tools (or otherwise has tools that only
+make sense for one platform), declare each platform-specific tool under
+`platforms.<p>.tools:` and keep genuinely cross-platform tools at the top level under
+`target.tools:`. See
+[Trailmaps → Per-platform scripted tools](trailmaps.md#per-platform-scripted-tools)
+for the example shape and the single-platform validation rule.
+
 See [Trailmaps](trailmaps.md) for the full manifest schema (dependencies, defaults,
 toolsets, waypoints).
 
@@ -281,15 +288,26 @@ in the legacy YAML descriptor. Every field is optional:
 
 | Field | Purpose |
 |---|---|
+| `description?: string` | Optional LLM-facing description. When set, takes precedence over the TSDoc above the `export const` (and a YAML sidecar's `description:`, if any, still takes precedence over both — see [Where the description comes from](#where-the-description-comes-from)). Use when you want a tighter agent-facing string than the TSDoc and don't want to maintain a sidecar YAML. |
 | `supportedPlatforms?: ("web" \| "android" \| "ios" \| "desktop")[]` | Registration gate. Tool is only registered for sessions whose platform matches. Empty/omitted = all platforms. |
 | `requiresContext?: boolean` | UX hint surfaced in tool catalogs — "this tool needs a live device session to be useful" (e.g. it dispatches UI tools that won't work without a connected emulator / browser). Not a registration filter; informational only. |
-| `requiresHost?: boolean` | Registration gate. Skip registering on-device QuickJS runs. Use when the tool needs Node-only APIs (`node:fs`, `node:child_process`, file locks) — the on-device runtime can't reach them. |
+| `requiresHost?: boolean` | On-device *visibility* gate — skip registering this (in-process) tool on-device. NOT a runtime selector: it does not give the tool Node APIs. A tool that needs `node:fs` / `node:child_process` / native modules selects the subprocess runtime with `runtime: subprocess` in its descriptor (host-only by nature); see the [Runtime](#runtime-quickjs-in-process-by-default) section. |
 | `supportedDrivers?: string[]` | Registration gate, finer-grained than `supportedPlatforms`. Use when a tool depends on driver-specific capabilities (e.g. `"playwright-native"` only). |
 
-There is **no `description` field on the spec.** The tool's description lives in the
-TSDoc above the `export const` binding — that's the single source of truth the analyzer
-reads, and forcing it into TSDoc keeps the IDE-hover text and the LLM-facing description
-identical by construction.
+### Where the description comes from
+
+Three places can supply the LLM-facing description for a scripted tool. The framework
+resolves them in this order, with the first one that's set winning:
+
+1. **A YAML sidecar's `description:` field** (legacy / per-tool YAML shape).
+2. **The spec's `description?:` field** (when set on the `trailblaze.tool(...)` spec).
+3. **The TSDoc above the `export const`** (the default, and what every typed example in
+   this page uses).
+
+The TSDoc default keeps the IDE-hover text and the LLM-facing description identical by
+construction, which is what you want for almost every tool. Reach for spec
+`description` when you specifically want to keep implementation notes in TSDoc and ship
+a different agent-facing string.
 
 A tool whose spec is `{ supportedPlatforms: ["web"], requiresContext: true }` is the
 canonical shape for a UI-driving web tool. Mobile UI tools use
@@ -485,8 +503,10 @@ Helpers take `ctx: ToolContext` directly (no `client` argument) and live in
 
 ## Tool descriptions: what the LLM actually sees
 
-The TSDoc on each exported `const` is the **only** way the LLM learns what your tool
-does. Two non-obvious rules:
+The TSDoc on each exported `const` is what the LLM reads to learn what your tool does
+(unless you've set a higher-precedence source — see
+[Where the description comes from](#where-the-description-comes-from)). Two non-obvious
+rules:
 
 - **Don't write "USE THIS TOOL FOR X."** The LLM picks tools by matching the prompt
   against the description's prose. Telling it to "use" the tool reduces the description
@@ -605,25 +625,51 @@ runtime globals (`URL`, `fetch`, `AbortController`, `console`); Node-flavored bu
 (`node:fs`, `node:child_process`, `node:os`) are not present.
 
 If your tool needs full Node-compatible APIs — `node:fs`, persistent state, native
-modules — opt into the **host subprocess** runtime by setting `requiresHost: true` on
-the spec. The framework spawns a Bun subprocess for that tool's invocations; the rest of
-your trailmap stays in-process.
+modules — select the **host subprocess** runtime by setting `runtime: subprocess` in the
+tool's descriptor. The framework spawns a Bun subprocess for that tool's invocations,
+where the Node surface exists; the rest of your trailmap stays in-process. `runtime` is a
+descriptor field, not part of the typed `trailblaze.tool(...)` spec, so the tool carries a
+`<name>.yaml` descriptor that sets it:
 
-```ts
-export const myapp_writeArtifact = trailblaze.tool<WriteArtifactArgs>(
-  { requiresHost: true },
-  async (input, ctx) => {
-    const fs = await import("node:fs/promises");
-    await fs.writeFile(input.path, input.body);
-    return `Wrote ${input.path}.`;
-  },
-);
+```yaml
+# myapp_writeArtifact.yaml
+script: ./myapp_writeArtifact.ts
+name: myapp_writeArtifact
+description: Write a text artifact on the host.
+runtime: subprocess      # the runtime selector — dispatch to a host bun subprocess (Node APIs)
+requiresHost: true       # separate visibility gate — also skip registering on-device
 ```
 
-`requiresHost: true` also hides the tool from on-device sessions — the on-device runner
-skips registration entirely. Composition with other tools still works (the proxy routes
-through the same daemon), so a host-only tool can call into in-process tools and vice
-versa.
+```ts
+// myapp_writeArtifact.ts
+export const myapp_writeArtifact = trailblaze.tool<WriteArtifactArgs>(async (input) => {
+  const fs = await import("node:fs/promises");
+  await fs.writeFile(input.path, input.body);
+  return `Wrote ${input.path}.`;
+});
+```
+
+`runtime: subprocess` and `requiresHost: true` are **independent** flags, and a Node-API
+tool typically sets both:
+
+- **`runtime: subprocess`** is the *runtime selector* — it dispatches the handler to the
+  host Bun subprocess where `node:*` exists. Without it the tool defaults to in-process
+  QuickJS, where a `node:fs` import fails. A subprocess can't run on a device, so such a
+  tool is host-only by nature.
+- **`requiresHost: true`** is only an on-device *visibility* gate — it skips registering
+  the tool on-device. On its own it does **not** select a Node runtime, so it alone won't
+  give a tool Node APIs.
+
+Composition with other tools still works (the proxy routes through the same daemon), so a
+host-only tool can call into in-process tools and vice versa. See
+[`sampleapp_writeArtifact`](https://github.com/block/trailblaze/blob/main/examples/android-sample-app/trails/config/trailmaps/sampleapp/tools/sampleapp_writeArtifact.yaml)
+for a worked example.
+
+For HTTP specifically, you usually don't need a subprocess at all — the in-process
+runtime ships a real `fetch`. See
+[Scripted Tools — Network Requests](scripted-tools-network-requests.md) for when `fetch`
+is enough (almost always) and when a subprocess tool is worth its host-only restriction
+and per-call overhead.
 
 ## When you still need a sibling YAML
 
@@ -667,6 +713,9 @@ If you don't recognize yourself in those three cases, you don't need a YAML — 
 - **[Scripted Tools — Project Layout & Generated Files](scripted-tools-project-layout.md)** —
   workspace layout (source vs. generated), what each generated file is for, what to commit,
   and the fresh-clone bootstrap.
+- **[Scripted Tools — Network Requests](scripted-tools-network-requests.md)** — making
+  HTTP calls from a tool: in-process `fetch` (the default, host-dispatched) vs. a
+  subprocess tool (host-only) for what `fetch` can't reach.
 - **[`examples/ios-contacts/README`](https://github.com/block/trailblaze/blob/main/examples/ios-contacts/README.md)**
   / **[`examples/wikipedia/README`](https://github.com/block/trailblaze/blob/main/examples/wikipedia/README.md)**
   — the worked references this page draws from, with their own quick-starts and CI
