@@ -39,7 +39,12 @@ import kotlin.system.exitProcess
   description = [
     "Generate an HTML report for session recordings, plus a best-effort JSON summary, and " +
       "optionally MP4/GIF/WebP exports for a single session. JSON-only failures log a warning " +
-      "and still exit 0 — HTML is the primary artifact and is what gates the exit code.",
+      "and still exit 0 — HTML is the primary artifact and is what gates the exit code. " +
+      "Animated exports collapse long idle gaps between steps so their length tracks the " +
+      "number of steps, not the session's real wall-clock. The capture window for all three " +
+      "(--gif/--webp/--video) is bounded by the MAX_PLAYBACK_WAIT_MS environment variable " +
+      "(milliseconds, default 600000); if playback overruns it, a best-effort truncated " +
+      "artifact is still written with a warning.",
   ]
 )
 class ReportCommand : Callable<Int> {
@@ -511,12 +516,12 @@ internal fun generateSessionReport(
   val gifFile = resolveExportPath(effectiveGifSpec, htmlFile, defaultNames.gif)
   val webpFile = resolveExportPath(effectiveWebpSpec, htmlFile, defaultNames.webp)
   if (gifFile != null || webpFile != null) {
-    // Preflight ffmpeg + libwebp_anim BEFORE capture if we're going to encode WebP.
-    // Same fail-fast rationale as the single-format path: avoid burning 30s on
-    // screenshotting only to discover the encoder isn't installed.
+    // Preflight the libwebp tools BEFORE capture if we're going to encode WebP. Same
+    // fail-fast rationale as the single-format path: avoid burning 30s on screenshotting
+    // only to discover the WebP tooling isn't installed.
     if (webpFile != null) {
       try {
-        ReportWebpExporter.requireLibwebpAnim()
+        ReportWebpExporter.requireWebpTools()
       } catch (e: IllegalStateException) {
         Console.error("Failed to export report WebP: ${e.message}")
         cleanupOutputsOnFailure(outputsToCleanupOnFailure)
