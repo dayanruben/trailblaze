@@ -27,7 +27,7 @@ object AndroidHostAdbUtils {
   private val dadbClients = ConcurrentHashMap<String, Dadb>()
 
   // Tracks active port forwards (host port → AutoCloseable) so removePortForward can tear them
-  // down. dadb's tcpForward returns an AutoCloseable that owns the forward's lifetime.
+  // down. The AutoCloseable owns the forward's lifetime (removes it via the adb binary on close).
   private val activeForwards = ConcurrentHashMap<Pair<String, Int>, AutoCloseable>()
 
   // Default per-shell-call timeout for command paths that need a bounded wait (`logcat -d`,
@@ -249,8 +249,8 @@ object AndroidHostAdbUtils {
   /**
    * Runs an `adb` ProcessBuilder with a timeout, force-killing it if it does not exit in time.
    * Matches the legacy `process.waitFor(timeout, SECONDS) -> destroyForcibly` pattern that protected
-   * device discovery and port-forward cleanup from a wedged adb/adbd. Returns true on a clean exit
-   * within the deadline.
+   * device discovery and port-forward cleanup from a wedged adb/adbd. Returns true only if the
+   * process exited within the deadline with a zero exit code.
    */
   private fun runProcessBuilderWithTimeout(
     pb: ProcessBuilder,
@@ -262,13 +262,50 @@ object AndroidHostAdbUtils {
       process.destroyForcibly()
       process.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
     }
-    finished
+    finished && process.exitValue() == 0
   } catch (_: Exception) {
     false
   }
 
   suspend fun isAppInstalled(appId: String, deviceId: TrailblazeDeviceId): Boolean =
     listInstalledPackages(deviceId).any { it == appId }
+
+  /**
+   * Installs a host→device `adb forward tcp:$localPort tcp:$remotePort` via the real adb binary
+   * (NOT dadb's [Dadb.tcpForward], which drops the connection immediately on some devices —
+   * e.g. the Galaxy Tab S8 — flooding "tcp:<port>: closed"). Returns an [AutoCloseable] that tears
+   * the forward down via `adb forward --remove tcp:$localPort`. Mirrors [adbPortForwardLocalAbstract]
+   * and [adbPortReverse], which already shell out to the binary.
+   *
+   * @throws IOException if the `adb forward` command times out or exits non-zero.
+   */
+  private fun installAdbForwardViaBinary(
+    deviceId: TrailblazeDeviceId,
+    localPort: Int,
+    remotePort: Int,
+  ): AutoCloseable {
+    val installed = runProcessBuilderWithTimeout(
+      createAdbCommandProcessBuilder(
+        deviceId = deviceId,
+        args = listOf("forward", "tcp:$localPort", "tcp:$remotePort"),
+      ),
+      timeoutMs = DEFAULT_SHORT_CALL_TIMEOUT_MS,
+    )
+    if (!installed) {
+      throw IOException("adb forward tcp:$localPort tcp:$remotePort failed or timed out")
+    }
+    return AutoCloseable {
+      runCatching {
+        runProcessBuilderWithTimeout(
+          createAdbCommandProcessBuilder(
+            deviceId = deviceId,
+            args = listOf("forward", "--remove", "tcp:$localPort"),
+          ),
+          timeoutMs = DEFAULT_SHORT_CALL_TIMEOUT_MS,
+        )
+      }
+    }
+  }
 
   /**
    * Sets up a host→device TCP forward, equivalent to `adb forward tcp:local tcp:remote`. Idempotent
@@ -287,17 +324,13 @@ object AndroidHostAdbUtils {
     }
     try {
       Console.log("Setting up port forward tcp:$localPort -> tcp:$remotePort")
-      val forwarder = withDadb(deviceId) { it.tcpForward(localPort, remotePort) }
-      val existing = activeForwards.putIfAbsent(key, forwarder)
-      if (existing != null) {
-        // Lost a race — close the duplicate.
-        runCatching { forwarder.close() }
-      }
+      // Real `adb forward` binary instead of dadb.tcpForward (which fails on some devices).
+      val forwarder = installAdbForwardViaBinary(deviceId, localPort, remotePort)
+      // If we lost a race, the winner governs the same underlying `adb forward` (idempotent by
+      // localPort), so just drop our duplicate AutoCloseable WITHOUT running `--remove`.
+      activeForwards.putIfAbsent(key, forwarder)
     } catch (e: Exception) {
-      // Many transports throw with a null `message` (notably dadb's BindException for
-      // "Address already in use"), so falling back to `e.javaClass.simpleName` keeps the
-      // user-visible error informative instead of "null". Stack trace is still preserved
-      // via the `cause` parameter for log inspection.
+      // Fall back to the class name when message is blank, so the error isn't just "null".
       val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
       throw RuntimeException(
         "Failed to start port forwarding tcp:$localPort -> tcp:$remotePort on " +
@@ -317,9 +350,10 @@ object AndroidHostAdbUtils {
    * table — queried directly via the `host:list-forward` host-service (the authoritative source,
    * not the in-process [activeForwards] map which can be stale). Then unconditionally tears down
    * any tracked forwarder this JVM held for that (deviceId, localPort) pair and re-establishes a
-   * fresh one via [Dadb.tcpForward]. Returns the pre-recovery presence state for callers that
-   * want to structure failure messages or telemetry: `true` = entry was PRESENT in the adb
-   * server's table, `false` = ABSENT, `null` = could not determine (host-services query failed).
+   * fresh one via the real adb binary (see [installAdbForwardViaBinary]). Returns the pre-recovery
+   * presence state for callers that want to structure failure messages or telemetry: `true` =
+   * entry was PRESENT in the adb server's table, `false` = ABSENT, `null` = could not determine
+   * (host-services query failed).
    */
   fun diagnoseAndReAdbPortForward(
     deviceId: TrailblazeDeviceId,
@@ -341,14 +375,10 @@ object AndroidHostAdbUtils {
     val key = deviceId.instanceId to localPort
     activeForwards.remove(key)?.let { runCatching { it.close() } }
     try {
-      val forwarder = withDadb(deviceId) { it.tcpForward(localPort, remotePort) }
-      val existing = activeForwards.putIfAbsent(key, forwarder)
-      if (existing != null) {
-        // Lost a race — close the duplicate so we don't leak its socket.
-        runCatching { forwarder.close() }
-      }
+      val forwarder = installAdbForwardViaBinary(deviceId, localPort, remotePort)
+      activeForwards.putIfAbsent(key, forwarder)
     } catch (e: Exception) {
-      Console.log("[AndroidHostAdbUtils] dadb tcpForward (recovery) failed: ${e.message}")
+      Console.log("[AndroidHostAdbUtils] adb forward (recovery) failed: ${e.message}")
     }
     return wasActive
   }
