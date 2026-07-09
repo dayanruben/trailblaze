@@ -2,6 +2,7 @@ package xyz.block.trailblaze.host.rules
 
 import ai.koog.http.client.ktor.KtorKoogHttpClient
 import ai.koog.prompt.executor.clients.LLMClient
+import ai.koog.prompt.executor.clients.anthropic.AnthropicClientSettings
 import ai.koog.prompt.executor.clients.anthropic.AnthropicLLMClient
 import ai.koog.prompt.executor.clients.google.GoogleLLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
@@ -11,7 +12,9 @@ import io.ktor.client.HttpClient
 import xyz.block.trailblaze.host.llm.OpenAICompatibleLlmClientFactory
 import xyz.block.trailblaze.llm.LlmProviderEnvVarUtil
 import xyz.block.trailblaze.llm.TrailblazeLlmProvider
+import xyz.block.trailblaze.llm.config.BuiltInLlmModelRegistry
 import xyz.block.trailblaze.llm.config.LlmConfigLoader
+import xyz.block.trailblaze.llm.config.LlmConfigResolver
 import xyz.block.trailblaze.llm.config.LlmProviderType
 import xyz.block.trailblaze.llm.providers.TrailblazeDynamicLlmTokenProvider
 import xyz.block.trailblaze.mcp.utils.JvmLLMProvidersUtil
@@ -25,6 +28,18 @@ import xyz.block.trailblaze.mcp.utils.JvmLLMProvidersUtil
 object TrailblazeHostDynamicLlmTokenProvider : TrailblazeDynamicLlmTokenProvider {
 
   private val loadedConfig by lazy { LlmConfigLoader.load() }
+
+  /**
+   * Anthropic models as the user's `trailblaze.yaml` resolves them. Overridden fields
+   * (`context_length`, `max_output_tokens`, `vision`) and custom model ids produce LLModel
+   * forms that differ from the built-in registry entries, so the client's modelVersionsMap
+   * must include these too or koog rejects them as "Unsupported model".
+   */
+  private val resolvedAnthropicModels by lazy {
+    LlmConfigResolver.resolve(loadedConfig).modelLists
+      .filter { it.provider.id == TrailblazeLlmProvider.ANTHROPIC.id }
+      .flatMap { it.entries }
+  }
 
   val ollamaBaseUrl: String? by lazy {
     loadedConfig.providers["ollama"]?.baseUrl
@@ -101,6 +116,12 @@ object TrailblazeHostDynamicLlmTokenProvider : TrailblazeDynamicLlmTokenProvider
       when (trailblazeLlmProvider) {
         TrailblazeLlmProvider.ANTHROPIC -> AnthropicLLMClient(
           apiKey = apiKey,
+          settings = AnthropicClientSettings(
+            modelVersionsMap = BuiltInLlmModelRegistry.koogModelVersionsMap(
+              TrailblazeLlmProvider.ANTHROPIC,
+              extraModels = resolvedAnthropicModels,
+            ),
+          ),
           httpClientFactory = httpClientFactory,
         )
 

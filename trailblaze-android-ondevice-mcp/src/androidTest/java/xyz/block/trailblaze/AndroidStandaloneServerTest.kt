@@ -2,6 +2,8 @@ package xyz.block.trailblaze
 
 import ai.koog.http.client.ktor.KtorKoogHttpClient
 import ai.koog.prompt.executor.clients.LLMClient
+import ai.koog.prompt.executor.clients.anthropic.AnthropicClientSettings
+import ai.koog.prompt.executor.clients.anthropic.AnthropicLLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.ollama.client.OllamaClient
 import ai.koog.prompt.llm.LLMProvider
@@ -16,6 +18,7 @@ import xyz.block.trailblaze.android.devices.TrailblazeAndroidOnDeviceClassifier
 import xyz.block.trailblaze.android.runner.rpc.OnDeviceRpcServer
 import xyz.block.trailblaze.devices.TrailblazeDeviceClassifier
 import xyz.block.trailblaze.llm.TrailblazeLlmProvider
+import xyz.block.trailblaze.llm.config.BuiltInLlmModelRegistry
 import xyz.block.trailblaze.llm.config.LlmAuthResolver
 import xyz.block.trailblaze.http.DefaultDynamicLlmClient
 import xyz.block.trailblaze.http.DynamicLlmClient
@@ -89,6 +92,19 @@ class AndroidStandaloneServerTest : BaseAndroidStandaloneServerTest() {
     InstrumentationArgUtil.getInstrumentationArg(LlmAuthResolver.resolve(TrailblazeLlmProvider.OPENAI))?.let { openAiApiKey ->
       llmClients[LLMProvider.OpenAI] = OpenAILLMClient(
         apiKey = openAiApiKey,
+        httpClientFactory = httpClientFactory,
+      )
+    }
+    InstrumentationArgUtil.getInstrumentationArg(LlmAuthResolver.resolve(TrailblazeLlmProvider.ANTHROPIC))?.let { anthropicApiKey ->
+      llmClients[LLMProvider.Anthropic] = AnthropicLLMClient(
+        apiKey = anthropicApiKey,
+        settings = AnthropicClientSettings(
+          // Include the model this request resolved on the host — it may carry yaml overrides
+          // (or the built-in YAML may be unreadable on-device), so the built-in map alone can
+          // miss its LLModel key.
+          modelVersionsMap = BuiltInLlmModelRegistry
+            .koogModelVersionsMap(TrailblazeLlmProvider.ANTHROPIC, extraModels = listOf(trailblazeLlmModel)),
+        ),
         httpClientFactory = httpClientFactory,
       )
     }
