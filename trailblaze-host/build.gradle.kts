@@ -106,10 +106,24 @@ abstract class CheckTrailRunnerTypesTask @Inject constructor(objects: ObjectFact
   @get:Internal
   abstract val logFile: RegularFileProperty
 
+  @get:Internal
+  abstract val bunCacheDir: DirectoryProperty
+
   private fun run(log: java.io.File, vararg cmd: String) {
     val proc = try {
       ProcessBuilder(*cmd)
         .directory(webDir.get().asFile)
+        .apply {
+          // bun resolves its install cache as $BUN_INSTALL/install/cache; a set-but-EMPTY
+          // BUN_INSTALL (seen in some app-spawned environments) turns that into a CWD-relative
+          // `install/cache` — i.e. a cache directory dropped INSIDE src/main/resources, whose
+          // entry names embed the resolving registry host. Pin the cache into the build dir so
+          // the location never depends on the inherited environment; an explicitly set
+          // BUN_INSTALL_CACHE_DIR is a deliberate operator choice and is respected.
+          if (environment()["BUN_INSTALL_CACHE_DIR"].isNullOrBlank()) {
+            environment()["BUN_INSTALL_CACHE_DIR"] = bunCacheDir.get().asFile.absolutePath
+          }
+        }
         .redirectErrorStream(true)
         .redirectOutput(ProcessBuilder.Redirect.appendTo(log))
         .start()
@@ -484,6 +498,46 @@ val copyScriptedToolWrapperTemplate by tasks.registering(Copy::class) {
   into(layout.buildDirectory.dir("generated-resources/scripted-tool-wrapper/xyz/block/trailblaze/scripting"))
 }
 
+// Stage the agent skill (`SKILL.md` + `SETUP.md` + `references/` + any `scripts/`/assets) as JAR
+// resources so `trailblaze skill` can print/install it from any installed CLI (Homebrew,
+// install.sh) without a repo checkout. `Sync` (not `Copy`) so a file deleted from the skill can't
+// linger as a stale resource. The generated `manifest.txt` (one relative path per line, sorted) is
+// how the runtime enumerates the files — JAR classpath "directories" can't be listed. Consumed by
+// `BundledAgentSkill`.
+//
+// Which skill ships is variant-gated: the Internal build bundles the *superset* skill maintained at
+// the repo root (extra internal-only references + scripts, with the shared references symlinked back
+// to the OSS copy — `Sync` dereferences those symlinks so their content lands in the jar). The OSS
+// build bundles the public skill that lives alongside this module. The Internal path resolves
+// against `rootDir`, which is the internal repo root only in the internal Gradle build; in the OSS
+// mirror `trailblaze.variant` is unset, so that branch is never taken.
+val agentSkillSourceDir: File =
+  if (providers.gradleProperty("trailblaze.variant").orNull == "Internal") {
+    rootDir.resolve(".claude/skills/trailblaze")
+  } else {
+    layout.projectDirectory.dir("../skills/trailblaze").asFile
+  }
+val copyAgentSkillResources by tasks.registering(Sync::class) {
+  group = "trailblaze"
+  description = "Stages the trailblaze agent skill into this module's JAR resources."
+  from(agentSkillSourceDir) {
+    // Ship every file in the curated skill dir (markdown, scripts, assets) — not just markdown, so a
+    // reference that points at a helper script installs a working copy. `.DS_Store` and editor swap
+    // files are the only things excluded.
+    exclude("**/.DS_Store", "**/*.swp")
+  }
+  into(layout.buildDirectory.dir("generated-resources/agent-skill/xyz/block/trailblaze/skill"))
+  doLast {
+    val root = destinationDir
+    val entries = root.walkTopDown()
+      .filter { it.isFile }
+      .map { it.relativeTo(root).invariantSeparatorsPath }
+      .sorted()
+      .toList()
+    root.resolve("manifest.txt").writeText(entries.joinToString("\n") + "\n")
+  }
+}
+
 // Add generated resources to source sets
 sourceSets {
   main {
@@ -494,6 +548,9 @@ sourceSets {
     resources.srcDir(
       copyScriptedToolWrapperTemplate.map { layout.buildDirectory.dir("generated-resources/scripted-tool-wrapper").get() },
     )
+    resources.srcDir(
+      copyAgentSkillResources.map { layout.buildDirectory.dir("generated-resources/agent-skill").get() },
+    )
   }
 }
 
@@ -501,6 +558,7 @@ tasks.named<org.gradle.language.jvm.tasks.ProcessResources>("processResources") 
   dependsOn(generateVersionProperties)
   dependsOn(copyTypescriptCompilerResources)
   dependsOn(copyScriptedToolWrapperTemplate)
+  dependsOn(copyAgentSkillResources)
 }
 
 dependencyGuard {
@@ -581,6 +639,10 @@ tasks.matching { t ->
   if (this is AbstractCopyTask) {
     exclude(
       "**/trailrunner/web/node_modules/**",
+      // bun's local install-cache fallback (a broken environment can drop `install/cache` in the
+      // web dir — see CheckTrailRunnerTypesTask); its entry names embed the resolving registry
+      // host, so it must never be packaged.
+      "**/trailrunner/web/install/**",
       "**/trailrunner/web/package.json",
       "**/trailrunner/web/bun.lock",
       "**/trailrunner/web/tsconfig*.json",
@@ -626,6 +688,7 @@ val checkTrailRunnerTypes by tasks.registering(CheckTrailRunnerTypesTask::class)
   webDir.set(trailRunnerWebDir)
   marker.set(layout.buildDirectory.file("tmp/check-trailrunner-types.marker"))
   logFile.set(layout.buildDirectory.file("tmp/check-trailrunner-types.log"))
+  bunCacheDir.set(layout.buildDirectory.dir("tmp/bun-install-cache"))
 }
 
 tasks.named("check") { dependsOn(checkTrailRunnerTypes) }

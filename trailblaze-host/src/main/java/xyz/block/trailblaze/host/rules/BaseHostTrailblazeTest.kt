@@ -6,7 +6,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
 import org.junit.Rule
 import org.junit.rules.RuleChain
-import xyz.block.trailblaze.AgentMemory
 import xyz.block.trailblaze.TrailblazeYamlUtil
 import xyz.block.trailblaze.agent.DefaultProgressReporter
 import xyz.block.trailblaze.agent.InnerLoopScreenAnalyzer
@@ -363,7 +362,6 @@ abstract class BaseHostTrailblazeTest(
       screenStateProvider = hostRunner.screenStateProvider,
       toolRepo = toolRepo,
       elementComparator = elementComparator,
-      agentMemory = (trailblazeAgent as? xyz.block.trailblaze.BaseTrailblazeAgent)?.memory ?: AgentMemory(),
     )
 
     val session = loggingRule.session ?: error("Session not available - ensure test is running")
@@ -588,6 +586,13 @@ abstract class BaseHostTrailblazeTest(
     forceStopApp: Boolean = true,
     useRecordedSteps: Boolean = true,
     sendSessionStartLog: Boolean,
+    /**
+     * CLI `--memory` / `--secret` seeds, composed with the trail's `config.memory:` block via
+     * [xyz.block.trailblaze.AgentMemory.seedFrom] before any tool runs (later tiers win on a
+     * same-key collision; sensitive values are redacted from logs and the Started snapshot).
+     */
+    initialMemorySeeds: Map<String, String> = emptyMap(),
+    initialMemorySensitiveSeeds: Map<String, String> = emptyMap(),
   ): HostYamlRunResult {
     // Make sure the app is stopped before the test so the LLM doesn't get confused and think it's already running.
     if (forceStopApp) {
@@ -609,6 +614,16 @@ abstract class BaseHostTrailblazeTest(
       )
       return HostYamlRunResult(loggingRule.session?.sessionId ?: SessionId("unknown"))
     }
+
+    // Seed the agent's memory before any tool runs — same [AgentMemory.seedFrom] composition
+    // as every other host runner path. The agent threads this memory into every tool execution
+    // context, so `{{var}}` interpolation and scripted tools' `ctx.memory` both see the seeds.
+    val resolvedInitialMemory = trailblazeAgent.memory.seedFrom(
+      yamlDefaults = trailConfig?.memory,
+      cliSeeds = initialMemorySeeds,
+      cliSensitiveSeeds = initialMemorySensitiveSeeds,
+    )
+    val sensitiveMemoryKeys: Set<String> = trailblazeAgent.memory.sensitiveKeys.toSet()
 
     if (sendSessionStartLog) {
       val session = loggingRule.session
@@ -639,6 +654,8 @@ abstract class BaseHostTrailblazeTest(
               rawYaml = yaml,
               hasRecordedSteps = trailblazeYaml.hasRecordedSteps(trailItems),
               trailblazeDeviceId = trailblazeDeviceId,
+              resolvedInitialMemory = resolvedInitialMemory,
+              sensitiveMemoryKeys = sensitiveMemoryKeys,
               targetAppInfo = MobileDeviceUtils.resolveTargetAppInfo(
                 target = appTarget,
                 trailblazeDeviceId = trailblazeDeviceId,
@@ -713,6 +730,8 @@ abstract class BaseHostTrailblazeTest(
     sendSessionStartLog: Boolean,
     forceStopApp: Boolean = true,
     useRecordedSteps: Boolean = true,
+    initialMemorySeeds: Map<String, String> = emptyMap(),
+    initialMemorySensitiveSeeds: Map<String, String> = emptyMap(),
   ): SessionId = runBlocking {
     // JUnit callers only care about the session id; the tool-result payload is threaded
     // through the suspend variant for the `trailblaze tool` host path.
@@ -723,7 +742,9 @@ abstract class BaseHostTrailblazeTest(
       traceId = traceId,
       forceStopApp = forceStopApp,
       useRecordedSteps = useRecordedSteps,
-      sendSessionStartLog = sendSessionStartLog
+      sendSessionStartLog = sendSessionStartLog,
+      initialMemorySeeds = initialMemorySeeds,
+      initialMemorySensitiveSeeds = initialMemorySensitiveSeeds,
     ).sessionId ?: SessionId("unknown")
   }
 
