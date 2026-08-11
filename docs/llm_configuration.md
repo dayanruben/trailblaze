@@ -4,6 +4,10 @@ title: LLM Configuration
 
 Trailblaze supports configurable LLM providers and models via YAML files. This allows teams to use enterprise endpoints, custom gateways, self-hosted models, and project-specific defaults without modifying source code.
 
+> **Just want to use a model Trailblaze doesn't ship with?** You don't need a new release —
+> add it to your workspace config. [Adding a Model](adding_a_model.md) is the short,
+> task-focused version of this page.
+
 ## Configuration Loading Order
 
 Configuration is loaded from multiple locations. Later sources override earlier ones:
@@ -38,10 +42,10 @@ llm:
   providers:
     openai:
       models:
-        - id: gpt-4.1
-        - id: gpt-4.1-mini
+        - id: gpt-5.6-terra
+        - id: gpt-5.6-luna
   defaults:
-    model: gpt-4.1
+    model: gpt-5.6-terra
 ```
 
 When anyone clones the repo and launches Trailblaze, they get these models by default.
@@ -62,14 +66,14 @@ llm:
       auth:
         env_var: CORP_LLM_API_KEY
       models:
-        - id: gpt-4.1
-          context_length: 1048576
-          max_output_tokens: 32768
-        - id: gpt-4.1-mini
-          context_length: 1048576
-          max_output_tokens: 32768
+        - id: gpt-5.6-terra
+          context_length: 1050000
+          max_output_tokens: 128000
+        - id: gpt-5.6-luna
+          context_length: 1050000
+          max_output_tokens: 128000
   defaults:
-    model: gpt-4.1
+    model: gpt-5.6-terra
 ```
 
 Team members only need to set `CORP_LLM_API_KEY` in their environment. The gateway URL, headers, and model selection are all defined in the project.
@@ -86,12 +90,12 @@ providers:
     auth:
       env_var: OPENAI_API_KEY
     models:
-      - id: gpt-4.1
-      - id: gpt-4.1-mini
-      - id: gpt-5
+      - id: gpt-5.6-terra
+      - id: gpt-5.6-luna
+      - id: gpt-5.6-sol
         cost:
-          input_per_million: 1.25
-          output_per_million: 10.00
+          input_per_million: 5.00
+          output_per_million: 30.00
 
   # Custom OpenAI-compatible endpoint
   azure_openai:
@@ -116,7 +120,7 @@ providers:
         max_output_tokens: 8192
 
 defaults:
-  model: gpt-4.1
+  model: gpt-5.6-terra
 ```
 
 ### Provider fields
@@ -167,7 +171,7 @@ When `id` matches a built-in model (see [Built-in Models](generated/LLM_MODELS.m
 
 ```yaml
 defaults:
-  model: gpt-4.1
+  model: gpt-5.6-terra
   screenshot:
     max_dimensions: 1536x768   # Default screenshot scaling (default if omitted)
 ```
@@ -198,14 +202,14 @@ llm:
       auth:
         env_var: ACME_AI_TOKEN
       models:
-        - id: gpt-4.1
-          context_length: 1048576
-          max_output_tokens: 32768
-        - id: gpt-4.1-mini
-          context_length: 1048576
-          max_output_tokens: 32768
+        - id: gpt-5.6-terra
+          context_length: 1050000
+          max_output_tokens: 128000
+        - id: gpt-5.6-luna
+          context_length: 1050000
+          max_output_tokens: 128000
   defaults:
-    model: gpt-4.1
+    model: gpt-5.6-terra
 ```
 
 Individual developers can still override by creating `~/.trailblaze/trailblaze.yaml` in their home directory (user-level config takes lower priority, but environment variables take highest priority).
@@ -227,10 +231,13 @@ llm:
       models:
         - id: qwen3-vl:8b
         - id: qwen3.5:27b
-        - id: llama3.2:latest
   defaults:
     model: qwen3-vl:8b
 ```
+
+Both ids above are in the built-in registry, so they need no spec. A model the registry
+doesn't know falls back to a generic context length — give those an explicit spec, as
+[Custom model specs](#custom-model-specs) below shows.
 
 Models that are not installed will show a warning in the desktop app UI indicating the model is not available via Ollama. Developers can install them with:
 
@@ -249,6 +256,64 @@ For Ollama models not in the built-in registry, provide context length and outpu
   context_length: 131072
   max_output_tokens: 8192
 ```
+
+For a text-only model, also set `vision: false` — otherwise Trailblaze attaches screenshots
+to requests (including AI-backed assertions) and Ollama rejects them with a 400.
+
+### Context window (`num_ctx`)
+
+Trailblaze requests a 64K context window (`num_ctx: 65536`) on every Ollama call, clamped
+down to the model's declared `context_length` when that is lower.
+
+**Trailblaze now owns this setting.** A `num_ctx` on the request sits at the top of
+Ollama's precedence chain — above a `PARAMETER num_ctx` in the model's Modelfile, and above
+the server's `OLLAMA_CONTEXT_LENGTH` — so neither of those takes effect for Trailblaze's
+requests any more. Use `TRAILBLAZE_OLLAMA_NUM_CTX` (below) rather than a server-side
+setting, which will look like it is being ignored.
+
+The clamp only applies to a model whose `context_length` Trailblaze knows: one in the
+built-in registry, or one you declared with an explicit spec. A model with neither falls
+back to a generic context length, and the clamp does nothing for it — so if such a model's
+real window is smaller than the requested value, declare its `context_length` (see
+[Custom model specs](#custom-model-specs)) instead of relying on the clamp.
+
+When a request doesn't ask for a context window, Ollama picks one itself, sized to the
+memory it has available rather than to what the model supports — so the same model gets a
+large window on a workstation and a very small one on a laptop. A single Trailblaze agent
+turn (screenshot + view hierarchy + tool definitions) is ~20K tokens on a content-heavy
+screen, which is more than the low end of that range, and the turn fails with
+`exceed_context_size_error`. Asking explicitly is what makes the context predictable
+across machines instead of a property of the developer's hardware.
+
+64K is a deliberate middle: several multi-turn agent loops fit, and the KV cache still
+fits a laptop. On a machine with a lot of memory Ollama's automatic choice can be larger
+than 64K, and an explicit request replaces it — raise it with the override below if you
+run very long loops on such a machine.
+
+Override the requested value with `TRAILBLAZE_OLLAMA_NUM_CTX`:
+
+```bash
+TRAILBLAZE_OLLAMA_NUM_CTX=32768 trailblaze run --no-daemon login.trail.yaml
+```
+
+Lower it if your machine can't afford the 64K KV cache for a larger model; raise it for
+very long agent loops. Malformed or non-positive values fall back to the default.
+
+The value is read from the process that builds the Ollama client. `trailblaze run`
+normally hands the run to a background daemon, which inherits the environment it was
+started with — so a one-shot prefix like the above only applies with `--no-daemon`. To
+change it for daemon-backed runs, restart the daemon with the variable set:
+
+```bash
+trailblaze stop
+TRAILBLAZE_OLLAMA_NUM_CTX=32768 trailblaze app start
+```
+
+The override applies to host-side clients only. Android on-device runs always request the
+64K default, because the instrumentation process has no host environment to read. If you
+set the override *and* run on-device AI legs against the same Ollama server, the two ends
+request different context lengths and Ollama reloads the model on every alternation — leave
+it unset for those runs.
 
 ## Environment Variables
 
@@ -289,10 +354,10 @@ Create `src/androidTest/resources/trails/config/trailblaze.yaml` in your test mo
 ```yaml
 llm:
   defaults:
-    model: openai/gpt-4.1
+    model: openai/gpt-5.6-terra
 ```
 
-The model key uses `provider/model_id` format (e.g., `openai/gpt-4.1`, `anthropic/claude-sonnet-4-6`). AGP strips dot-prefixed directories from classpath resources, so the config lives under `trails/config/` instead of `.trailblaze/`.
+The model key uses `provider/model_id` format (e.g., `openai/gpt-5.6-terra`, `anthropic/claude-sonnet-5`). AGP strips dot-prefixed directories from classpath resources, so the config lives under `trails/config/` instead of `.trailblaze/`.
 
 Then use `AndroidTrailblazeRule` with zero-arg defaults:
 
@@ -319,7 +384,7 @@ If you don't want a config file, pass the model as an instrumentation arg:
 
 ```bash
 adb shell am instrument \
-  -e trailblaze.llm.default_model "openai/gpt-4.1" \
+  -e trailblaze.llm.default_model "openai/gpt-5.6-terra" \
   -e trailblaze.llm.auth.token.openai "sk-..." \
   -w com.example.test/androidx.test.runner.AndroidJUnitRunner
 ```
@@ -370,3 +435,5 @@ Trailblaze ships with a registry of models from major providers. See [Built-in L
 When referencing a built-in model by `id` in your YAML config, all specs (pricing, context length, capabilities) are inherited automatically. You only need to specify fields you want to override.
 
 Built-in model specs are updated with each Trailblaze release. If you need stable, predictable pricing or specs, override them in your workspace config.
+
+**A model missing from the registry is not blocked** — the registry only saves you from typing the specs. Declare any model your provider serves in `trails/config/trailblaze.yaml` and it works on the next run, no upgrade needed. See [Adding a Model](adding_a_model.md), which also covers contributing the model back to the built-in registry.

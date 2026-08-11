@@ -3,6 +3,7 @@ package xyz.block.trailblaze.toolcalls
 import xyz.block.trailblaze.android.tools.AndroidSystemUiDemoModeTrailblazeTool
 import xyz.block.trailblaze.mobile.tools.ClearAppDataTrailblazeTool
 import xyz.block.trailblaze.devices.TrailblazeDriverType
+import xyz.block.trailblaze.toolcalls.commands.AssertMatchCountTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.AssertNotVisibleBySelectorTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.AssertVisibleBySelectorTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.AssertVisibleWithAccessibilityTextTrailblazeTool
@@ -15,6 +16,8 @@ import xyz.block.trailblaze.toolcalls.commands.SwipeWithRelativeCoordinatesTool
 import xyz.block.trailblaze.toolcalls.commands.TapOnByElementSelector
 import xyz.block.trailblaze.toolcalls.commands.TapOnElementWithAccessiblityTextTrailblazeTool
 import xyz.block.trailblaze.toolcalls.commands.TapOnElementWithTextTrailblazeTool
+import xyz.block.trailblaze.toolcalls.commands.memory.RememberNumberBySelectorTrailblazeTool
+import xyz.block.trailblaze.toolcalls.commands.memory.RememberTextBySelectorTrailblazeTool
 import kotlin.reflect.KClass
 
 @Suppress("ktlint:standard:property-naming")
@@ -51,6 +54,9 @@ abstract class TrailblazeToolSet(
       // Used by recordings, but shouldn't be registered directly to the LLM
       AssertVisibleBySelectorTrailblazeTool::class,
       AssertNotVisibleBySelectorTrailblazeTool::class,
+      AssertMatchCountTrailblazeTool::class,
+      RememberTextBySelectorTrailblazeTool::class,
+      RememberNumberBySelectorTrailblazeTool::class,
       TapOnByElementSelector::class,
       SwipeWithRelativeCoordinatesTool::class,
       AndroidSystemUiDemoModeTrailblazeTool::class,

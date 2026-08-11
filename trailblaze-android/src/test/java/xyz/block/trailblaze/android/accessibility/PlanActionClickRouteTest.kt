@@ -5,6 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import xyz.block.trailblaze.api.DriverNodeDetail
 import xyz.block.trailblaze.api.TrailblazeNode
+import xyz.block.trailblaze.model.TapRouteOverride
 
 /**
  * Pure-function coverage of [planActionClickRoute] — the gate that decides whether a
@@ -100,6 +101,115 @@ class PlanActionClickRouteTest {
       plan,
       "Clickable wrappers without direct text/contentDescription must use the gesture path — " +
         "the real click handler isn't reachable via `performClick()` on the wrapper.",
+    )
+  }
+
+  @Test
+  fun `routes to ACTION_CLICK for a checked option row whose label lives on a child node`() {
+    // An unmerged-semantics option row: the node owns the checked state but not the label, so
+    // it fails the leaf-text check while being exactly the shape ACTION_CLICK handles best.
+    // A Compose `selectable` row surfaces this way — `android.view.View` carrying
+    // isCheckable/isChecked, with the label on a child text node — so a
+    // `{containsChild: {textRegex: "<label>"}}` selector resolves to the textless parent.
+    val plan = planActionClickRoute(
+      node = node(
+        bounds = TrailblazeNode.Bounds(40, 1720, 1040, 1860),
+        detail = androidA11y(
+          className = "android.view.View",
+          actions = listOf(ACTION_CLICK_NAME),
+          isCheckable = true,
+          isChecked = true,
+        ),
+      ),
+      longPress = false,
+    )
+    assertEquals(
+      ActionClickPlan(
+        bounds = TrailblazeNode.Bounds(40, 1720, 1040, 1860),
+        className = "android.view.View",
+        resourceId = null,
+      ),
+      plan,
+      "A checkable node publishing its state must keep ACTION_CLICK even with no text of its own.",
+    )
+  }
+
+  @Test
+  fun `routes to ACTION_CLICK for an unchecked option row that publishes a stateDescription`() {
+    // The other half of the population: a not-currently-selected row reports isChecked=false but
+    // still advertises its state via stateDescription. Every textless checkable node in the
+    // committed downstream android waypoint fixtures carries "Selected" or "Not selected" this
+    // way, so gating on isChecked alone would send the unselected ones back to gesture.
+    val plan = planActionClickRoute(
+      node = node(
+        bounds = TrailblazeNode.Bounds(40, 1720, 1040, 1860),
+        detail = androidA11y(
+          className = "android.view.View",
+          actions = listOf(ACTION_CLICK_NAME),
+          isCheckable = true,
+          isChecked = false,
+          stateDescription = "Not selected",
+        ),
+      ),
+      longPress = false,
+    )
+    assertEquals(
+      ActionClickPlan(
+        bounds = TrailblazeNode.Bounds(40, 1720, 1040, 1860),
+        className = "android.view.View",
+        resourceId = null,
+      ),
+      plan,
+      "An unselected option row that publishes stateDescription still qualifies.",
+    )
+  }
+
+  @Test
+  fun `declines a checkable container that publishes no checked state`() {
+    // The exemption's justification is that ACTION_CLICK toggles a node which owns the state it
+    // claims. A textless container that sets isCheckable but reports neither isChecked nor a
+    // stateDescription has made no such claim, and its real handler may sit elsewhere. An
+    // accordion option row is this shape: ACTION_CLICK selects the option while only a real
+    // touch expands the row holding the sub-options, so a recorded follow-up tap on a
+    // sub-option finds nothing.
+    val plan = planActionClickRoute(
+      node = node(
+        bounds = TrailblazeNode.Bounds(80, 1115, 1000, 1260),
+        detail = androidA11y(
+          className = "android.view.View",
+          actions = listOf(ACTION_CLICK_NAME),
+          isCheckable = true,
+        ),
+      ),
+      longPress = false,
+    )
+    assertNull(
+      plan,
+      "A stateless checkable container must use the gesture path like any other wrapper.",
+    )
+  }
+
+  @Test
+  fun `checkable exemption does not bypass the other gate conditions`() {
+    // The exemption is scoped to the leaf-text check alone. A checkable node that fails a
+    // different condition must still decline — here `isVisibleToUser=false`, the overlay gate,
+    // where ACTION_CLICK would bypass the OS hit-test's z-order and fire an occluded node.
+    val plan = planActionClickRoute(
+      node = node(
+        bounds = TrailblazeNode.Bounds(40, 1720, 1040, 1860),
+        detail = androidA11y(
+          className = "android.view.View",
+          actions = listOf(ACTION_CLICK_NAME),
+          isCheckable = true,
+          isChecked = true,
+          isVisibleToUser = false,
+        ),
+      ),
+      longPress = false,
+    )
+    assertNull(
+      plan,
+      "Checkable only exempts the leaf-text check — every other condition still gates.",
     )
   }
 
@@ -276,6 +386,149 @@ class PlanActionClickRouteTest {
     assertNull(plan, "Hidden background nodes must defer to the OS z-order via the gesture path.")
   }
 
+  @Test
+  fun `an ACTION_CLICK pin promotes a stateless checkable container the gate declines`() {
+    // The shape that needs the pin: an option row inside a dropdown sheet, textless because the
+    // label is on a child node, checkable, and publishing no state at all because the driver
+    // reads `stateDescription` only from API 30 (below that the platform field doesn't exist and
+    // Compose's backport lands in the node's extras, which the driver doesn't read). On such a
+    // device the row is field-identical to a stateless wrapper whose handler lives elsewhere, so
+    // no predicate over these fields can separate them — only the recording knows.
+    val row = node(
+      bounds = TrailblazeNode.Bounds(0, 1200, 1080, 1340),
+      detail = androidA11y(
+        className = "android.view.View",
+        actions = listOf(ACTION_CLICK_NAME),
+        isCheckable = true,
+      ),
+    )
+    assertEquals(
+      ActionClickPlan(
+        bounds = TrailblazeNode.Bounds(0, 1200, 1080, 1340),
+        className = "android.view.View",
+        resourceId = null,
+      ),
+      planActionClickRoute(node = row, longPress = false, tapRoute = TapRouteOverride.ACTION_CLICK),
+      "An ACTION_CLICK pin must reach past the leaf-vs-container judgement.",
+    )
+    assertNull(
+      planActionClickRoute(node = row, longPress = false, tapRoute = null),
+      "Negative control — the same node with no pin must still decline, so every unpinned tap " +
+        "in every other recording keeps the route it has today.",
+    )
+  }
+
+  @Test
+  fun `a GESTURE pin declines a node the gate would otherwise route semantically`() {
+    // The mirror-image shape: a row that publishes state (so the gate grants ACTION_CLICK) but
+    // whose semantic click performs a different action than a real touch — an accordion header
+    // whose ACTION_CLICK selects while only a touch expands the sub-options a later step taps.
+    // Such a row publishes "Collapsed"/"Expanded" natively from API 30, so the pin is how a
+    // recording holds its route when the same trail moves to a newer device.
+    val row = node(
+      bounds = TrailblazeNode.Bounds(0, 1100, 1080, 1240),
+      detail = androidA11y(
+        className = "android.view.View",
+        actions = listOf(ACTION_CLICK_NAME),
+        isCheckable = true,
+        stateDescription = "Collapsed",
+      ),
+    )
+    assertNull(
+      planActionClickRoute(node = row, longPress = false, tapRoute = TapRouteOverride.GESTURE),
+      "A GESTURE pin must decline even a node that satisfies every gate condition.",
+    )
+    assertEquals(
+      ActionClickPlan(
+        bounds = TrailblazeNode.Bounds(0, 1100, 1080, 1240),
+        className = "android.view.View",
+        resourceId = null,
+      ),
+      planActionClickRoute(node = row, longPress = false, tapRoute = null),
+      "Negative control — without the pin this node routes semantically, which is what makes " +
+        "the assertion above about the pin rather than about the node.",
+    )
+  }
+
+  @Test
+  fun `an ACTION_CLICK pin cannot dispatch an action the node cannot answer`() {
+    // The pin overrides one judgement — leaf-vs-container — not the conditions that make
+    // ACTION_CLICK dispatchable at all. A recording that pins a route the node can't honor gets
+    // the gesture path rather than a dispatch that silently reports success.
+    val pin = TapRouteOverride.ACTION_CLICK
+    assertNull(
+      planActionClickRoute(node = clickableNode(), longPress = true, tapRoute = pin),
+      "Long-press has no ACTION_CLICK to pin.",
+    )
+    assertNull(
+      planActionClickRoute(
+        node = TrailblazeNode(bounds = null, driverDetail = androidA11y("android.view.View")),
+        longPress = false,
+        tapRoute = pin,
+      ),
+      "Without bounds there is no identity to find in the live tree.",
+    )
+    assertNull(
+      planActionClickRoute(
+        node = node(
+          bounds = TrailblazeNode.Bounds(0, 0, 100, 100),
+          detail = androidA11y(className = "android.view.View", actions = emptyList()),
+        ),
+        longPress = false,
+        tapRoute = pin,
+      ),
+      "A node that doesn't advertise ACTION_CLICK has nothing to dispatch.",
+    )
+    assertNull(
+      planActionClickRoute(
+        node = node(
+          bounds = TrailblazeNode.Bounds(0, 0, 100, 100),
+          detail = androidA11y(
+            className = "android.widget.EditText",
+            text = "user@example.com",
+            actions = listOf(ACTION_CLICK_NAME),
+            isEditable = true,
+          ),
+        ),
+        longPress = false,
+        tapRoute = pin,
+      ),
+      "Editable fields still need the touch offset for caret placement.",
+    )
+    assertNull(
+      planActionClickRoute(
+        node = node(
+          bounds = TrailblazeNode.Bounds(0, 0, 100, 100),
+          detail = androidA11y(
+            className = "android.widget.Button",
+            text = "Submit",
+            actions = listOf(ACTION_CLICK_NAME),
+            isVisibleToUser = false,
+          ),
+        ),
+        longPress = false,
+        tapRoute = pin,
+      ),
+      "An occluded node must still defer to the OS z-order.",
+    )
+    assertNull(
+      planActionClickRoute(
+        node = node(
+          bounds = TrailblazeNode.Bounds(0, 0, 100, 100),
+          detail = androidA11y(
+            className = "android.widget.Button",
+            text = "Submit",
+            actions = listOf(ACTION_CLICK_NAME),
+            isEnabled = false,
+          ),
+        ),
+        longPress = false,
+        tapRoute = pin,
+      ),
+      "A disabled node's performAction returns false; route to gesture so retry surfaces it.",
+    )
+  }
+
   // --- Test helpers ---
 
   /**
@@ -307,6 +560,9 @@ class PlanActionClickRouteTest {
     isEnabled: Boolean = true,
     isEditable: Boolean = false,
     isVisibleToUser: Boolean = true,
+    isCheckable: Boolean = false,
+    isChecked: Boolean = false,
+    stateDescription: String? = null,
   ): DriverNodeDetail.AndroidAccessibility = DriverNodeDetail.AndroidAccessibility(
     className = className,
     resourceId = resourceId,
@@ -316,5 +572,8 @@ class PlanActionClickRouteTest {
     isEnabled = isEnabled,
     isEditable = isEditable,
     isVisibleToUser = isVisibleToUser,
+    isCheckable = isCheckable,
+    isChecked = isChecked,
+    stateDescription = stateDescription,
   )
 }

@@ -8,6 +8,8 @@ title: External Config
 
 Trailblaze's desktop/CLI binary currently builds the effective app-target config from three layers, in order: framework-bundled `trails/config/**` resources, an optional workspace `trails/config/` directory, and the current workspace's `trails/config/trailblaze.yaml` entries. Later layers override earlier ones by id / filename.
 
+> This page covers the `trails/config/` **directory** — authoring targets, toolsets, and tools. The `trailblaze.yaml` **file** itself (its keys, workspace defaults, and precedence) is documented in [Configuration](../configuration.md).
+
 The intended split is now the live split: `trails/` is the workspace anchor, `trails/config/trailblaze.yaml` is the workspace manifest, and `trails/config/` is the artifact directory that holds concrete trailmap, target, toolset, and tool files, plus the reserved location for provider YAMLs.
 
 ## Lookup Order for Filesystem Config
@@ -171,7 +173,7 @@ Toolsets are declared in `trailmaps/<id>/toolsets/*.yaml`. They are pure YAML gr
 | `android_primitives` | Yes | `android-ondevice-accessibility`, `android-ondevice-instrumentation` | 7 |
 | `compose_core` | No | `compose` | 6 |
 | `compose_verification` | No | `compose` | 3 |
-| `core_interaction` | Yes | `android-ondevice-accessibility`, `android-ondevice-instrumentation`, `ios-axe`, `ios-host` | 20 |
+| `core_interaction` | Yes | `android-ondevice-accessibility`, `android-ondevice-instrumentation`, `ios-axe`, `ios-host` | 21 |
 | `memory` | No | `all drivers` | 8 |
 | `meta` | Yes | `all drivers` | 1 |
 | `mobile_primitives` | Yes | `android-ondevice-accessibility`, `android-ondevice-instrumentation`, `ios-axe`, `ios-host` | 5 |

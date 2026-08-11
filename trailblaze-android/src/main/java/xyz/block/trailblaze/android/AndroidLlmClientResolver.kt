@@ -7,6 +7,7 @@ import ai.koog.prompt.executor.clients.anthropic.AnthropicLLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.clients.openrouter.OpenRouterLLMClient
+import ai.koog.prompt.executor.ollama.client.ContextWindowStrategy
 import ai.koog.prompt.executor.ollama.client.OllamaClient
 import ai.koog.prompt.llm.LLMProvider
 import xyz.block.trailblaze.android.openai.OpenAiInstrumentationArgUtil
@@ -20,6 +21,7 @@ import com.charleskorn.kaml.YamlConfiguration
 import xyz.block.trailblaze.llm.config.BuiltInLlmModelRegistry
 import xyz.block.trailblaze.llm.config.TrailblazeConfigPaths
 import xyz.block.trailblaze.llm.config.LlmAuthResolver
+import xyz.block.trailblaze.llm.config.OllamaContextWindow
 import xyz.block.trailblaze.llm.config.TrailblazeProjectYamlConfig
 import xyz.block.trailblaze.util.Console
 
@@ -63,14 +65,15 @@ object AndroidLlmClientResolver {
    * Resolves the first available model from the given [candidates], falling back to
    * [resolveModel] if none match.
    *
-   * Each candidate is a model key like `"open_router/openai/gpt-4.1"` or `"openai/gpt-4.1"`.
-   * The provider is inferred from the key and checked for an available auth token.
+   * Each candidate is a model key like `"open_router/openai/gpt-oss-120b:free"` or
+   * `"openai/gpt-5.6-terra"`. The provider is inferred from the key and checked for an
+   * available auth token.
    *
    * Example:
    * ```
    * AndroidLlmClientResolver.resolveModel(
-   *   "open_router/openai/gpt-4.1",  // prefer free tier
-   *   "openai/gpt-4.1",              // fall back to paid
+   *   "open_router/openai/gpt-oss-120b:free",  // prefer free tier
+   *   "openai/gpt-5.6-terra",                  // fall back to paid
    * )
    * ```
    */
@@ -95,7 +98,7 @@ object AndroidLlmClientResolver {
    *
    * Resolution order:
    * 1. `llm.defaults.model` from `trails/config/trailblaze.yaml` classpath resource
-   * 2. Explicit `trailblaze.llm.default_model` instrumentation arg (e.g., "openai/gpt-4.1")
+   * 2. Explicit `trailblaze.llm.default_model` instrumentation arg (e.g., "openai/gpt-5.6-terra")
    * 3. Auto-detect: tries [PROVIDER_PRIORITY] in order (OpenAI → OpenRouter → Anthropic →
    *    Google → Ollama) and returns the first model whose provider has an auth token available.
    */
@@ -106,7 +109,7 @@ object AndroidLlmClientResolver {
       return findOrFallback(modelKey)
     }
 
-    // 2. Instrumentation arg from host (e.g., "openai/gpt-4.1")
+    // 2. Instrumentation arg from host (e.g., "openai/gpt-5.6-terra")
     val defaultModelArg =
       InstrumentationArgUtil.getInstrumentationArg(LlmAuthResolver.DEFAULT_MODEL_ARG)
     if (defaultModelArg != null) {
@@ -167,6 +170,11 @@ object AndroidLlmClientResolver {
         OllamaClient(
           baseUrl = ollamaBaseUrl ?: "http://localhost:11434",
           httpClientFactory = httpClientFactory,
+          // Request num_ctx on every call — left to itself Ollama sizes the window to the
+          // memory it has available, which can reject real agent turns (~20K tokens)
+          // regardless of the model's declared context.
+          // No env override on-device; the host-side knob is TRAILBLAZE_OLLAMA_NUM_CTX.
+          contextWindowStrategy = ContextWindowStrategy.Companion.Fixed(OllamaContextWindow.DEFAULT_NUM_CTX),
         ),
       )
 
