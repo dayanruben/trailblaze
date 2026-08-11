@@ -6,6 +6,30 @@ Install `trailblaze` on your `PATH` first — `brew install block/tap/trailblaze
 quickest path. The instructions below assume the CLI is reachable so on-device
 instrumentation tests can be authored and run against the sample project under
 `examples/`.
+### Add the instrumentation dependency
+`trailblaze-android` carries the on-device driver and `AndroidTrailblazeRule`, and exposes what
+the rule's API surface touches (JUnit, UiAutomator, `trailblaze-common`) as `api` dependencies.
+Add `androidx.test:runner` alongside it — the `AndroidJUnitRunner` that executes the tests is
+not part of the published graph:
+```kotlin
+// build.gradle.kts
+dependencies {
+  androidTestImplementation("xyz.block.trailblaze:trailblaze-android:<version>")
+  androidTestRuntimeOnly("androidx.test:runner:1.7.0")
+}
+```
+(If you pass a custom `llmClient` to the rule, also declare the matching
+`ai.koog:prompt-executor-*-client` dependency — the client implementations are not re-exported.)
+Releases are published to Maven Central under the
+[`xyz.block.trailblaze`](https://central.sonatype.com/namespace/xyz.block.trailblaze) group, and
+versioned `MAJOR.MINOR.PATCH-YYYY.MM.DD` — for example `0.1.0-2026.08.11`. The semver prefix is
+the API-compatibility signal; the date records when that build was cut. While the prefix is
+`0.x`, treat the API as unstable: any release may change it.
+
+Builds off `main` are published as `0.1.0-SNAPSHOT` to
+`https://central.sonatype.com/repository/maven-snapshots/` if you want to track unreleased work.
+Maven timestamps each snapshot deployment, so you can also pin an exact build
+(`0.1.0-20260811.010555-1`) rather than the moving `-SNAPSHOT`.
 ### Pass your LLM Provider API Key to Instrumentation
 1. Set up your provider API key on the development machine in your shell environment.
    The environment variable names are defined in `LlmProviderEnvVarUtil`.

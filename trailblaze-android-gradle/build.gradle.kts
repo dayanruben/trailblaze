@@ -7,6 +7,11 @@ plugins {
   alias(libs.plugins.vanniktech.maven.publish)
 }
 
+// Same bare-CalVer publish gate the including build applies. This is a separate Gradle build, so
+// the root's `apply(from = ...)` does not reach it — and it is the build most exposed to the
+// mistake, since it takes its release version from a `-Pversion` that propagates in from outside.
+apply(from = "../gradle/maven-version-guard.gradle.kts")
+
 gradlePlugin {
   // The public-facing OSS plugin id. External consumers reach this via:
   //   plugins { id("xyz.block.trailblaze.android-gradle") version "..." }
@@ -55,7 +60,11 @@ dependencies {
 // jar is on; javadoc jar is off because the only public API is the plugin's id + extension
 // (documented in this module's README).
 mavenPublishing {
-  publishToMavenCentral()
+  // `automaticRelease = true` matches the root `opensource/build.gradle.kts` subprojects block.
+  // Without it the Central Portal deployment uploads as USER_MANAGED and waits for a manual
+  // Publish click while the build reports success — see the comment there. Inert for SNAPSHOT
+  // versions, which bypass the deployment flow entirely.
+  publishToMavenCentral(automaticRelease = true)
   // Signing only kicks in when signing credentials are present (`signing.signingInMemoryKey`
   // etc.). `build` / `check` still work in CI without secrets — only the `publish` task
   // requires them. Matches the posture every other vanniktech-published module in this repo
