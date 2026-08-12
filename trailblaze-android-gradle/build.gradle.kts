@@ -5,7 +5,16 @@ plugins {
   `java-gradle-plugin`
   alias(libs.plugins.kotlin.jvm)
   alias(libs.plugins.vanniktech.maven.publish)
+  // Dokka renders the -javadoc jar Central requires. The root build applies dokka to every
+  // subproject, but this is a composite-included build the root's `subprojects {}` can't reach,
+  // so it applies its own (same version — shared catalog).
+  alias(libs.plugins.dokka)
 }
+
+// Same bare-CalVer publish gate the including build applies. This is a separate Gradle build, so
+// the root's `apply(from = ...)` does not reach it — and it is the build most exposed to the
+// mistake, since it takes its release version from a `-Pversion` that propagates in from outside.
+apply(from = "../gradle/maven-version-guard.gradle.kts")
 
 gradlePlugin {
   // The public-facing OSS plugin id. External consumers reach this via:
@@ -52,10 +61,14 @@ dependencies {
 // Use the `vanniktech.maven.publish.base` flavour (matches the rest of `opensource/`) and
 // configure for a Gradle plugin: this publishes the plugin's own `jar` artifact plus the
 // `<plugin-id>.gradle.plugin` marker artifact that `pluginManagement` resolves from. Sources
-// jar is on; javadoc jar is off because the only public API is the plugin's id + extension
-// (documented in this module's README).
+// jar is on; the javadoc jar carries Dokka's rendered HTML for the plugin sources (the primary
+// docs remain this module's README).
 mavenPublishing {
-  publishToMavenCentral()
+  // `automaticRelease = true` matches the root `opensource/build.gradle.kts` subprojects block.
+  // Without it the Central Portal deployment uploads as USER_MANAGED and waits for a manual
+  // Publish click while the build reports success — see the comment there. Inert for SNAPSHOT
+  // versions, which bypass the deployment flow entirely.
+  publishToMavenCentral(automaticRelease = true)
   // Signing only kicks in when signing credentials are present (`signing.signingInMemoryKey`
   // etc.). `build` / `check` still work in CI without secrets — only the `publish` task
   // requires them. Matches the posture every other vanniktech-published module in this repo
@@ -64,7 +77,9 @@ mavenPublishing {
 
   configure(
     GradlePlugin(
-      javadocJar = JavadocJar.None(),
+      // A real Dokka javadoc jar, not None: Central Portal validation rejects JVM jars without
+      // a javadoc entry — the v2026.08.11 deployment failed on this.
+      javadocJar = JavadocJar.Dokka("dokkaHtml"),
       sourcesJar = true,
     ),
   )

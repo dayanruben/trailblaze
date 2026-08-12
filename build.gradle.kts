@@ -81,24 +81,37 @@ subprojects {
 }
 
 // The OSS release workflow on `block/trailblaze` runs
-// `./gradlew publishAllPublicationsToMavenCentralRepository` from this root. That command
-// finds matching tasks across all subprojects in this build, but composite-included builds
-// (registered via `settings.gradle.kts`'s `pluginManagement.includeBuild(...)`) are isolated
-// — their publish tasks must be delegated explicitly or external consumers never receive the
-// published artifact + plugin marker. Register a root-level aggregator per included plugin
-// build so the existing release command transitively picks them up.
-val trailblazeAndroidGradlePluginPublishMavenCentral =
-  tasks.register("trailblazeAndroidGradlePluginPublishMavenCentral") {
+// `./gradlew publishAllPublicationsToMavenCentralRepository` from this root. Gradle resolves that
+// name against every project in *this* build, but composite-included builds (registered via
+// `settings.gradle.kts`'s `pluginManagement.includeBuild(...)`) are isolated — their publish tasks
+// must be delegated explicitly or external consumers never receive the published artifact + plugin
+// marker.
+//
+// Registering the delegating aggregator under the SAME name the release command already asks for
+// is what pulls the included build in. The root project applies no `maven-publish`/vanniktech
+// plugin, so it contributes no task of that name to collide with; the name match is the whole
+// mechanism. (A previous `tasks.matching { name == ... }.configureEach { dependsOn(...) }` hook
+// here never fired for exactly that reason — the root task container it filtered was empty — so
+// `trailblaze-android-gradle` was silently absent from every release.)
+//
+// vanniktech also registers `publishToMavenCentral` / `publishAndReleaseToMavenCentral` aliases
+// on every publishing subproject, so those names are delegated too — otherwise a manual
+// `./gradlew publishToMavenCentral` would silently reintroduce the missing-plugin bug for that
+// invocation.
+//
+// NOTE: `--dry-run` does NOT extend into the included build — Gradle executes delegated
+// included-build tasks for REAL even under `-m`. Don't "sanity check" these aggregators with
+// publish credentials exported.
+listOf(
+  "publishAllPublicationsToMavenCentralRepository",
+  "publishToMavenCentral",
+  "publishAndReleaseToMavenCentral",
+).forEach { publishTaskName ->
+  tasks.register(publishTaskName) {
     group = "publishing"
-    description =
-      "Publishes the included trailblaze-android-gradle build to Maven Central."
-    dependsOn(
-      gradle.includedBuild("trailblaze-android-gradle")
-        .task(":publishAllPublicationsToMavenCentralRepository"),
-    )
+    description = "Publishes the included trailblaze-android-gradle build to Maven Central."
+    dependsOn(gradle.includedBuild("trailblaze-android-gradle").task(":$publishTaskName"))
   }
-tasks.matching { it.name == "publishAllPublicationsToMavenCentralRepository" }.configureEach {
-  dependsOn(trailblazeAndroidGradlePluginPublishMavenCentral)
 }
 
 // Apply shared dependency-resolution forces (version pins) so every configuration resolves the
@@ -107,6 +120,12 @@ apply(from = "gradle/dependency-resolution.gradle.kts")
 
 // Apply shared git version computation
 apply(from = "gradle/git-version.gradle.kts")
+
+// Hard-fail any Maven Central publish attempted at a bare CalVer version. Applied AFTER
+// git-version.gradle.kts, which is the thing most likely to produce one: it sets
+// `version = 2026.08.11` on every build made from a `v*` tag, which is exactly the state a
+// release runs in.
+apply(from = "gradle/maven-version-guard.gradle.kts")
 
 subprojects
   .forEach {
@@ -126,7 +145,17 @@ subprojects
     it.afterEvaluate {
       if (it.plugins.hasPlugin("com.vanniktech.maven.publish.base")) {
         it.extensions.getByType(MavenPublishBaseExtension::class.java).also { publishing ->
-          publishing.publishToMavenCentral()
+          // `automaticRelease = true` is what actually makes a tagged release land on Maven
+          // Central. Without it the Central Portal deployment is uploaded as USER_MANAGED and
+          // parks in https://central.sonatype.com/publishing/deployments waiting for someone to
+          // click Publish — the Gradle build still reports BUILD SUCCESSFUL, which is how every
+          // release between 0.0.2 and now produced no consumable artifact. `validateDeployment`
+          // stays at its default `true` so the build blocks on the deployment reaching a terminal
+          // state and goes red on FAILED instead of succeeding into the void.
+          //
+          // SNAPSHOT builds are unaffected: they publish straight to the snapshot repository and
+          // never create a deployment, so the flag is inert on the `main` snapshot workflow.
+          publishing.publishToMavenCentral(automaticRelease = true)
           publishing.signAllPublications()
           publishing.pom {
             url.set("https://www.github.com/block/trailblaze")
@@ -152,11 +181,18 @@ subprojects
             }
           }
 
+          // A real javadoc jar, not None(): Central Portal validation REJECTS a deployment whose
+          // JVM jars carry no javadoc entry ("Javadocs must be provided but not found in
+          // entries") — the v2026.08.11 release failed on exactly this, across every KotlinJvm
+          // module and every KMP -jvm variant. Dokka is already applied to every subproject (top
+          // of this file), so the -javadoc classifier ships Dokka's rendered HTML — the standard
+          // Kotlin-ecosystem shape for Central. Android AARs are exempt from the requirement
+          // (they passed the same validation), so publishJavadocJar stays false below.
           if (plugins.hasPlugin("org.jetbrains.kotlin.jvm")) {
             publishing.configure(
               KotlinJvm(
                 sourcesJar = true,
-                javadocJar = JavadocJar.None(),
+                javadocJar = JavadocJar.Dokka("dokkaHtml"),
               )
             )
           }
@@ -165,7 +201,7 @@ subprojects
             publishing.configure(
               KotlinMultiplatform(
                 sourcesJar = true,
-                javadocJar = JavadocJar.None(),
+                javadocJar = JavadocJar.Dokka("dokkaHtml"),
               )
             )
           } else if (plugins.hasPlugin("com.android.library")) {
