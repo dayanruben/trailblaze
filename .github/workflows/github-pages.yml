@@ -42,8 +42,11 @@ jobs:
 
       - name: Fetch report-gallery assets
         # The landing page and Report Gallery embed per-trail assets (storyboard.webp /
-        # timeline.webp / report.html) that are NOT committed — they are produced by the
-        # trail workflows (`wikipedia-trails.yml` etc.) and pulled in here at build time.
+        # timeline.webp / report-interactive.html / session.zip) that are NOT committed —
+        # they are produced by the trail workflows (`wikipedia-trails.yml` etc.) and pulled
+        # in here at build time. session.zip is the archive the gallery's report-viewer
+        # deep-link loads; until a trail run publishes one, both tiers miss it and every
+        # slug walks all 10 completed runs looking (slow, best-effort, self-resolving).
         # Two tiers, fresh-then-last-good, so the gallery never shows the "generating"
         # placeholder once a real report has ever been published:
         #
@@ -79,7 +82,10 @@ jobs:
             local workflow="$1" dest="$2"
             local slug="${dest##*/}"
             local artifact="docs-report-$slug"
-            local files="storyboard.webp timeline.webp report.html"
+            # report-interactive.html, not report.html: `trailblaze report` writes both, and
+            # the WASM one is the deprecated format (and ~8x the size). session.zip is what
+            # the gallery's report-viewer deep-link loads.
+            local files="storyboard.webp timeline.webp report-interactive.html session.zip"
             mkdir -p "$dest"
 
             # Tier 1: freshest completed run carrying the artifact (newest-first walk).
@@ -132,6 +138,18 @@ jobs:
           fetch_assets "wikipedia-trails.yml" "docs/report-assets/wikipedia"
           fetch_assets "ios-contacts-trails.yml" "docs/report-assets/ios-contacts"
           fetch_assets "clock-trails.yml" "docs/report-assets/clock"
+
+      - name: Set up Bun
+        # `scripts/build-viewer-shell.sh` transpiles the viewer with bun macros.
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Build the standalone report viewer
+        # docs/report-viewer/index.html is generated, never committed (see .gitignore).
+        # Without this step docs_hooks.py drops its stand-in page and the published
+        # viewer is a placeholder that cannot open a session archive.
+        # Deliberately NOT continue-on-error: the script guards its own output, and a
+        # viewer that silently degrades to the placeholder is the failure mode to avoid.
+        run: ./scripts/build-viewer-shell.sh docs/report-viewer
 
       - name: Build MkDocs site
         run: mkdocs build --strict
