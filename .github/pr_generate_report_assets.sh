@@ -30,22 +30,19 @@ if [ ! -d "$LOGS_DIR" ]; then
   exit 0
 fi
 
-# ffmpeg with libwebp_anim is required for the animated --webp. The storyboard uses
-# bundled libwebp (no ffmpeg), so generate it in a separate CLI invocation below: if the
-# animated timeline preflight fails, the storyboard and HTML still publish.
-HAS_WEBP_ANIM=0
-if command -v ffmpeg >/dev/null 2>&1 && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libwebp_anim; then
-  HAS_WEBP_ANIM=1
-  echo "✓ ffmpeg with libwebp_anim found"
+# The animated --webp is assembled by libwebp's CLIs (img2webp, cwebp, webpmux — the
+# `webp` package), not ffmpeg. The storyboard uses bundled libwebp, so generate it in a
+# separate CLI invocation below: if the animated timeline preflight fails, the storyboard
+# and HTML still publish.
+HAS_WEBP_ANIM=1
+for tool in img2webp cwebp webpmux; do
+  command -v "$tool" >/dev/null 2>&1 || HAS_WEBP_ANIM=0
+done
+if [ "$HAS_WEBP_ANIM" = 1 ]; then
+  echo "✓ libwebp tools found"
 else
-  echo "WARNING: ffmpeg with libwebp_anim not found — the animated timeline.webp will be skipped."
+  echo "WARNING: libwebp tools (img2webp, cwebp, webpmux) not found — the animated timeline.webp will be skipped."
 fi
-
-# Nothing here builds or publishes the legacy WASM report: every invocation below passes
-# --no-wasm-report, so the gallery depends only on the interactive report and survives the
-# WASM report's removal untouched. (It also drops the CPU-bound WASM render from this job.)
-# Once that removal lands, the `-Ptrailblaze.wasm=true` the build-uber-jar job passes to
-# bundle the WASM template is dead weight for this workflow too.
 
 # Resolve the single session this trail produced. Session logs are per-session dirs under
 # $LOGS_DIR; skip the sibling `reports/` output dir. Newest wins if there's more than one.
@@ -60,14 +57,14 @@ echo "Using session: $SESSION_ID"
 # under any inline limits; the HTML report itself is not size-capped (it's a download/link-out).
 echo "Exporting storyboard + interactive report..."
 trailblaze report --id "$SESSION_ID" --output-dir "$OUT_DIR" \
-  --storyboard --no-wasm-report --max-size=8MB
+  --storyboard --max-size=8MB
 
 if [ "$HAS_WEBP_ANIM" = 1 ]; then
   # --no-gif: we only embed the WebP (GitHub/the docs render it the same, smaller file).
-  # The animated timeline records the interactive report (--export-from's default).
+  # The animated timeline records the interactive report.
   echo "Exporting animated WebP timeline..."
   trailblaze report --id "$SESSION_ID" --output-dir "$OUT_DIR" \
-    --webp --no-gif --no-wasm-report --max-size=8MB
+    --webp --no-gif --max-size=8MB
 fi
 
 # The session archive the hosted report viewer reads. Same shape the daemon's
@@ -91,8 +88,6 @@ ls -lh "$OUT_DIR" 2>/dev/null || echo "  (output dir not created — export fail
 echo "========================================="
 
 # Surface (without failing) whether the files the docs page needs are present.
-# report.html (the legacy WASM export) is deliberately NOT in this list: `trailblaze
-# report` still writes it, but the gallery publishes report-interactive.html.
 for f in storyboard.webp timeline.webp report-interactive.html session.zip; do
   if [ -f "$OUT_DIR/$f" ]; then
     echo "✓ $f"

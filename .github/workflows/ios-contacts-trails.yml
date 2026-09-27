@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Pre-build the trailblaze uber JAR (with WASM template embedded) once and
+  # Pre-build the trailblaze uber JAR once and
   # publish it as an artifact for the downstream trails job. Mirrors the
   # `build-uber-jar` job in `pr-checks.yml` — see that file's header comment
   # for the rationale. Runs on macos-26 (same runner OS as the downstream
@@ -61,9 +61,9 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
-      - name: Build trailblaze uber JAR (with WASM template embedded)
+      - name: Build trailblaze uber JAR
         env:
-          TRAILBLAZE_GRADLE_EXTRA_ARGS: -Ptrailblaze.wasm=true --parallel
+          TRAILBLAZE_GRADLE_EXTRA_ARGS: --parallel
         run: ./scripts/install-trailblaze-source.sh
 
       - name: Stage artifact contents
@@ -176,11 +176,9 @@ jobs:
           echo "✓ Simulator booted: $SIMULATOR_UDID"
 
       - name: Install ffmpeg-full (session video + animated-timeline WebP)
-        # macOS runners don't ship ffmpeg, and homebrew-core's plain `ffmpeg` formula
-        # is NOT built against libwebp — so the `libwebp_anim` encoder the docs gallery's
-        # animated timeline.webp needs is missing, and `pr_generate_report_assets.sh`
-        # silently falls back to publishing the committed placeholder. The sister
-        # `ffmpeg-full` formula depends on `webp` and provides the encoder. It's
+        # macOS runners don't ship ffmpeg. `ffmpeg-full` also depends on `webp`, which
+        # provides the libwebp CLIs (img2webp, cwebp, webpmux) the docs gallery's
+        # animated timeline.webp is assembled with. It's
         # keg-only (so it doesn't collide with a system `ffmpeg`), so prepend its bin
         # dir to GITHUB_PATH so the report-asset step picks it up.
         # The storyboard WebP uses bundled libwebp and needs no ffmpeg, so a brew
