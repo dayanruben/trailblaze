@@ -4,6 +4,6 @@
   "private": true,
   "main": "main.js",
   "dependencies": {
-    "electron": "^35.7.5"
+    "electron": "^45.0.0"
   }
 }
